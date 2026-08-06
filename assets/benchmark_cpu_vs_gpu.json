@@ -1,0 +1,50 @@
+{
+  "config": {
+    "num_frames": 16,
+    "num_patches": 265,
+    "gazing_ratio": 0.75,
+    "task_loss_req": 0.7,
+    "n_warmup": 3,
+    "n_runs": 10,
+    "gpu": "NVIDIA H100 PCIe",
+    "model": "nvidia/AutoGaze",
+    "model_params": 3258240
+  },
+  "CPU": {
+    "mean_ms": 737.08,
+    "min_ms": 719.62,
+    "max_ms": 852.95,
+    "std_ms": 38.93,
+    "runs_ms": [
+      719.84,
+      719.94,
+      727.97,
+      725.69,
+      852.95,
+      721.15,
+      719.62,
+      720.78,
+      727.21,
+      735.64
+    ]
+  },
+  "GPU": {
+    "mean_ms": 279.79,
+    "min_ms": 278.76,
+    "max_ms": 282.78,
+    "std_ms": 1.05,
+    "runs_ms": [
+      279.24,
+      279.43,
+      280.01,
+      279.6,
+      279.45,
+      278.76,
+      279.26,
+      279.75,
+      282.78,
+      279.66
+    ]
+  },
+  "speedup_cpu_over_gpu": 2.63
+}
