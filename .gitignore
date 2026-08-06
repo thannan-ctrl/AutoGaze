@@ -177,3 +177,22 @@ cython_debug/
 # Logs
 lightning_logs/
 checkpoints/
+
+.pytest_cache/
+__pycache__/
+Model-Optimizer/
+modelopt_outputs/
+agent_modelopt_output/
+
+# Slurm experiment dirs (created by slurm_exp_init)
+quantize/
+evaluate/
+profile/
+pipeline/
+
+# Generated outputs
+pipeline_summary.json
+agent_eval_output/
+agent_profile_output/
+agent_viz_output/
+agent_output/
