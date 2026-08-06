@@ -42,6 +42,48 @@ pip install uv
 uv pip install -e .
 ```
 
+## 📦 My Installation
+
+Platform-specific installation instructions for environments where the default
+`uv pip install -e .` fails due to CUDA/architecture mismatches.
+
+---
+
+### x86_64 — NVIDIA H100 / A100 (CUDA 13.0 driver)
+
+Tested on: `ipp2-2371`, H100 PCIe, Driver 580.x, CUDA 13.0
+
+```bash
+# 1. Create and activate conda environment
+conda create -n auto_gaze python=3.11
+conda activate auto_gaze
+
+# 2. Install uv
+pip install uv
+
+# 3. Install torch + torchvision (cu130 matches CUDA 13.0 driver)
+pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu130
+
+# 4. Install flash-attn (precompiled wheel available for x86_64 + cu130)
+pip install flash-attn --no-build-isolation
+
+# 5. Install remaining dependencies
+pip install \
+  "hydra-core>=1.3.2" \
+  wandb loguru \
+  "timm>=1.0.15" \
+  tqdm \
+  "transformers~=4.51" \
+  pillow numpy omegaconf matplotlib einops av imageio
+
+# 6. Install AutoGaze in editable mode (deps already installed above)
+pip install -e . --no-deps
+```
+
+> If `pip install flash-attn` falls back to a source build (takes 30-60 min),
+> check that `nvcc --version` matches your torch CUDA version. If nvcc is older
+> than the driver's reported CUDA version, add `--no-build-isolation` so flash-attn
+> uses the already-installed torch rather than resolving a fresh one.
 
 ## 💥 Quick Start
 
