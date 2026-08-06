@@ -65,7 +65,7 @@ pip install uv
 pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu130
 
 # 4. Install flash-attn (precompiled wheel available for x86_64 + cu130)
-pip install flash-attn --no-build-isolation
+conda install flash-attn
 
 # 5. Install remaining dependencies
 pip install \
