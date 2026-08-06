@@ -19,8 +19,8 @@ if torch.cuda.is_available():
 
 # Load model from HuggingFace
 print("[demo] Loading AutoGaze model...")
-autogaze_transform = AutoGazeImageProcessor.from_pretrained("bfshi/AutoGaze")
-autogaze_model = AutoGaze.from_pretrained("bfshi/AutoGaze")
+autogaze_transform = AutoGazeImageProcessor.from_pretrained("nvidia/AutoGaze")
+autogaze_model = AutoGaze.from_pretrained("nvidia/AutoGaze")
 autogaze_model = autogaze_model.cuda().eval()
 
 # Load video
