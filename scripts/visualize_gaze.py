@@ -25,11 +25,10 @@ print("[viz] Loading model...")
 autogaze_transform = AutoGazeImageProcessor.from_pretrained("nvidia/AutoGaze")
 autogaze_model = AutoGaze.from_pretrained("nvidia/AutoGaze").cuda().eval()
 
-gaze_model  = autogaze_model.gaze_model
-N_PATCHES   = gaze_model.num_vision_tokens_each_frame   # 196
-INPUT_SIZE  = gaze_model.input_img_size                 # 224
-GRID        = int(N_PATCHES ** 0.5)                     # 14
-PATCH_PX    = INPUT_SIZE // GRID                        # 16
+N_PATCHES   = autogaze_model.num_vision_tokens_each_frame          # 196
+INPUT_SIZE  = autogaze_model.gazing_model.input_img_size            # 224
+GRID        = int(N_PATCHES ** 0.5)                                 # 14
+PATCH_PX    = INPUT_SIZE // GRID                                    # 16
 
 # ── Load video ────────────────────────────────────────────────────────────────
 video_path = os.path.join(REPO_DIR, "assets", "example_input.mp4")
@@ -51,12 +50,8 @@ with torch.inference_mode():
         {"video": video_input}, gazing_ratio=0.75, task_loss_requirement=0.7
     )
 
-gazing_pos     = gaze_outputs["gazing_pos"][0]          # (total_patches,)
-if_padded      = gaze_outputs["if_padded_gazing"][0]    # (total_patches,)
-num_each_frame = gaze_outputs["num_gazing_each_frame"]  # (T,)
-
-pos_per_frame = gazing_pos.split(num_each_frame.tolist())
-pad_per_frame = if_padded.split(num_each_frame.tolist())
+# gazing_mask[0]: (B, T, N_patches) — 1 = gazed, 0 = not gazed
+gaze_mask = gaze_outputs["gazing_mask"][0][0].bool()   # (T, N_patches)
 
 # ── Resize raw frames to model input size ────────────────────────────────────
 frames_pil = [
@@ -78,13 +73,13 @@ annotated = []
 for t in range(T):
     base = frames_pil[t].copy().convert("RGBA")
 
-    pos_t = pos_per_frame[t] - N_PATCHES * t          # within-frame indices
-    real  = pos_t[~pad_per_frame[t]].cpu().numpy()    # non-padded
+    gazed_indices = gaze_mask[t].nonzero(as_tuple=True)[0].cpu().numpy()
+    n_gazed = len(gazed_indices)
 
     # Semi-transparent overlay layer
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw_ov = ImageDraw.Draw(overlay)
-    for idx in real:
+    for idx in gazed_indices:
         r, c = divmod(int(idx), GRID)
         x0, y0 = c * PATCH_PX, r * PATCH_PX
         x1, y1 = x0 + PATCH_PX, y0 + PATCH_PX
@@ -94,19 +89,19 @@ for t in range(T):
     draw = ImageDraw.Draw(blended)
 
     # Patch borders
-    for idx in real:
+    for idx in gazed_indices:
         r, c = divmod(int(idx), GRID)
         x0, y0 = c * PATCH_PX, r * PATCH_PX
         x1, y1 = x0 + PATCH_PX - 1, y0 + PATCH_PX - 1
         draw.rectangle([x0, y0, x1, y1], outline=BORDER_RGB, width=1)
 
     # Label
-    label = f"frame {t:02d}  |  {len(real)}/{N_PATCHES} patches"
+    label = f"frame {t:02d}  |  {n_gazed}/{N_PATCHES} patches gazed"
     draw.rectangle([4, 4, INPUT_SIZE - 4, 20], fill=(0, 0, 0, 160))
     draw.text((6, 5), label, fill=TEXT_RGB, font=font)
 
     annotated.append(np.array(blended))
-    print(f"  frame {t:02d}: {len(real)} patches gazed")
+    print(f"  frame {t:02d}: {n_gazed} patches gazed")
 
 # ── Save annotated video ──────────────────────────────────────────────────────
 out_video = os.path.join(REPO_DIR, "assets", "gaze_visualization.mp4")
