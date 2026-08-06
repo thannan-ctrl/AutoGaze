@@ -50,8 +50,25 @@ with torch.inference_mode():
         {"video": video_input}, gazing_ratio=0.75, task_loss_requirement=0.7
     )
 
-# gazing_mask[0]: (B, T, N_patches) — 1 = gazed, 0 = not gazed
-gaze_mask = gaze_outputs["gazing_mask"][0][0].bool()   # (T, N_patches)
+# Debug: print raw output shapes and counts
+print(f"[dbg] gazing_pos shape:        {gaze_outputs['gazing_pos'].shape}")
+print(f"[dbg] if_padded_gazing shape:  {gaze_outputs['if_padded_gazing'].shape}")
+print(f"[dbg] num_gazing_each_frame:   {gaze_outputs['num_gazing_each_frame']}")
+print(f"[dbg] actual gazed (non-pad):  {(~gaze_outputs['if_padded_gazing']).sum().item()}")
+print(f"[dbg] num gazing_mask scales:  {len(gaze_outputs['gazing_mask'])}")
+print(f"[dbg] gazing_mask[0] shape:    {gaze_outputs['gazing_mask'][0].shape}")
+print(f"[dbg] gazing_mask[0] sum:      {gaze_outputs['gazing_mask'][0].sum().item()}")
+print(f"[dbg] per-frame sums:          {gaze_outputs['gazing_mask'][0][0].sum(dim=-1).tolist()}")
+
+# gazing_mask[0]: (B, T_eff, N_patches) — 1 = gazed, 0 = not gazed
+gaze_mask = gaze_outputs["gazing_mask"][0][0].bool()   # (T_eff, N_patches)
+T_eff = gaze_mask.shape[0]
+print(f"[dbg] gaze_mask shape (T_eff, N): {gaze_mask.shape}")
+# If T_eff < T (frame_sampling_rate > 1), repeat each mask to cover all raw frames
+if T_eff < T:
+    frame_sampling_rate = T // T_eff
+    gaze_mask = gaze_mask.repeat_interleave(frame_sampling_rate, dim=0)  # (T, N)
+    print(f"[dbg] upsampled gaze_mask to: {gaze_mask.shape} (frame_sampling_rate={frame_sampling_rate})")
 
 # ── Resize raw frames to model input size ────────────────────────────────────
 frames_pil = [
@@ -105,10 +122,7 @@ for t in range(T):
 
 # ── Save annotated video ──────────────────────────────────────────────────────
 out_video = os.path.join(REPO_DIR, "assets", "gaze_visualization.mp4")
-writer = imageio.get_writer(out_video, fps=4, codec="libx264", quality=8)
-for frame in annotated:
-    writer.append_data(frame)
-writer.close()
+imageio.mimsave(out_video, annotated, fps=4, codec="libx264")
 print(f"[viz] Saved video → {out_video}")
 
 # ── Save frame grid PNG ───────────────────────────────────────────────────────
