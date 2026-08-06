@@ -50,25 +50,26 @@ with torch.inference_mode():
         {"video": video_input}, gazing_ratio=0.75, task_loss_requirement=0.7
     )
 
-# Debug: print raw output shapes and counts
-print(f"[dbg] gazing_pos shape:        {gaze_outputs['gazing_pos'].shape}")
-print(f"[dbg] if_padded_gazing shape:  {gaze_outputs['if_padded_gazing'].shape}")
-print(f"[dbg] num_gazing_each_frame:   {gaze_outputs['num_gazing_each_frame']}")
-print(f"[dbg] actual gazed (non-pad):  {(~gaze_outputs['if_padded_gazing']).sum().item()}")
-print(f"[dbg] num gazing_mask scales:  {len(gaze_outputs['gazing_mask'])}")
-print(f"[dbg] gazing_mask[0] shape:    {gaze_outputs['gazing_mask'][0].shape}")
-print(f"[dbg] gazing_mask[0] sum:      {gaze_outputs['gazing_mask'][0].sum().item()}")
-print(f"[dbg] per-frame sums:          {gaze_outputs['gazing_mask'][0][0].sum(dim=-1).tolist()}")
+# Each scale has its own spatial resolution: N_s patches → sqrt(N_s)×sqrt(N_s) grid
+scales          = gaze_outputs["scales"]                         # e.g. [56, 112, 168, 224]
+n_per_scale     = autogaze_model.num_vision_tokens_each_scale_each_frame  # e.g. [4, 16, 36, 196]
+n_scales        = len(scales)
+print(f"[viz] scales: {scales}  |  patches/scale: {n_per_scale}")
 
-# gazing_mask[0]: (B, T_eff, N_patches) — 1 = gazed, 0 = not gazed
-gaze_mask = gaze_outputs["gazing_mask"][0][0].bool()   # (T_eff, N_patches)
-T_eff = gaze_mask.shape[0]
-print(f"[dbg] gaze_mask shape (T_eff, N): {gaze_mask.shape}")
-# If T_eff < T (frame_sampling_rate > 1), repeat each mask to cover all raw frames
+# Build per-scale binary masks: list of (T_eff, N_s) bool tensors
+scale_masks = []
+T_eff = None
+for s in range(n_scales):
+    m = gaze_outputs["gazing_mask"][s][0].bool()   # (T_eff, N_s)
+    scale_masks.append(m)
+    if T_eff is None:
+        T_eff = m.shape[0]
+    print(f"  scale {s} ({scales[s]}px): mask {m.shape}, {m.sum().item():.0f} gazed patches total")
+
+# Upsample to full T if frame_sampling_rate > 1
 if T_eff < T:
-    frame_sampling_rate = T // T_eff
-    gaze_mask = gaze_mask.repeat_interleave(frame_sampling_rate, dim=0)  # (T, N)
-    print(f"[dbg] upsampled gaze_mask to: {gaze_mask.shape} (frame_sampling_rate={frame_sampling_rate})")
+    fsr = T // T_eff
+    scale_masks = [m.repeat_interleave(fsr, dim=0) for m in scale_masks]
 
 # ── Resize raw frames to model input size ────────────────────────────────────
 frames_pil = [
@@ -89,36 +90,44 @@ except Exception:
 annotated = []
 for t in range(T):
     base = frames_pil[t].copy().convert("RGBA")
-
-    gazed_indices = gaze_mask[t].nonzero(as_tuple=True)[0].cpu().numpy()
-    n_gazed = len(gazed_indices)
-
-    # Semi-transparent overlay layer
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw_ov = ImageDraw.Draw(overlay)
-    for idx in gazed_indices:
-        r, c = divmod(int(idx), GRID)
-        x0, y0 = c * PATCH_PX, r * PATCH_PX
-        x1, y1 = x0 + PATCH_PX, y0 + PATCH_PX
-        draw_ov.rectangle([x0, y0, x1, y1], fill=OVERLAY_RGBA)
+
+    total_gazed = 0
+    for s in range(n_scales):
+        n_s       = n_per_scale[s]
+        grid_s    = int(round(n_s ** 0.5))
+        patch_px_s = INPUT_SIZE // grid_s
+        alpha     = 60 + s * 15          # finer scales get slightly higher alpha
+        color     = (0, 220, 100, alpha)
+
+        gazed = scale_masks[s][t].nonzero(as_tuple=True)[0].cpu().numpy()
+        total_gazed += len(gazed)
+        for idx in gazed:
+            r, c = divmod(int(idx), grid_s)
+            x0, y0 = c * patch_px_s, r * patch_px_s
+            x1, y1 = x0 + patch_px_s, y0 + patch_px_s
+            draw_ov.rectangle([x0, y0, x1, y1], fill=color)
 
     blended = Image.alpha_composite(base, overlay).convert("RGB")
     draw = ImageDraw.Draw(blended)
 
-    # Patch borders
-    for idx in gazed_indices:
-        r, c = divmod(int(idx), GRID)
-        x0, y0 = c * PATCH_PX, r * PATCH_PX
-        x1, y1 = x0 + PATCH_PX - 1, y0 + PATCH_PX - 1
-        draw.rectangle([x0, y0, x1, y1], outline=BORDER_RGB, width=1)
+    # Patch borders (finest scale only — coarser ones would clutter)
+    finest_mask = scale_masks[-1][t]
+    n_s_fine   = n_per_scale[-1]
+    grid_fine  = int(round(n_s_fine ** 0.5))
+    patch_fine = INPUT_SIZE // grid_fine
+    for idx in finest_mask.nonzero(as_tuple=True)[0].cpu().numpy():
+        r, c = divmod(int(idx), grid_fine)
+        x0, y0 = c * patch_fine, r * patch_fine
+        draw.rectangle([x0, y0, x0+patch_fine-1, y0+patch_fine-1], outline=BORDER_RGB, width=1)
 
-    # Label
-    label = f"frame {t:02d}  |  {n_gazed}/{N_PATCHES} patches gazed"
+    label = f"frame {t:02d}  |  {total_gazed}/{N_PATCHES} patches gazed"
     draw.rectangle([4, 4, INPUT_SIZE - 4, 20], fill=(0, 0, 0, 160))
     draw.text((6, 5), label, fill=TEXT_RGB, font=font)
 
     annotated.append(np.array(blended))
-    print(f"  frame {t:02d}: {n_gazed} patches gazed")
+    print(f"  frame {t:02d}: {total_gazed} patches gazed")
 
 # ── Save annotated video ──────────────────────────────────────────────────────
 out_video = os.path.join(REPO_DIR, "assets", "gaze_visualization.mp4")
