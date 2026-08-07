@@ -65,46 +65,66 @@ def main():
     load_ms = (time.perf_counter() - t_load) * 1000
     print(f"[approach5] Model loaded in {load_ms:.0f} ms", flush=True)
 
-    # --- Process video ---
+    # --- Load video frames with av (PyAV) ---
+    import av
+    import numpy as np
     import torch
-    import torchvision.io as io
 
-    # Load video frames
-    video_frames, _, info = io.read_video(VIDEO_PATH, pts_unit="sec")
-    fps = info.get("video_fps", 30.0)
-    # Sample at ~2 fps, max 32 frames
+    container = av.open(VIDEO_PATH)
+    stream = container.streams.video[0]
+    fps = float(stream.average_rate) if stream.average_rate else 30.0
+    # Sample ~2 fps, max 32 frames
     step = max(1, int(fps / 2.0))
-    sampled_frames = video_frames[::step][:32]  # (T, H, W, C)
-    sampled_frames = sampled_frames.permute(0, 3, 1, 2).float() / 255.0  # (T, C, H, W)
-    print(f"[approach5] Video: {sampled_frames.shape[0]} frames @ {fps:.1f} fps", flush=True)
+    frames = []
+    for i, frame in enumerate(container.decode(video=0)):
+        if i % step == 0:
+            frames.append(frame.to_ndarray(format="rgb24"))
+        if len(frames) >= 32:
+            break
+    container.close()
+
+    # (T, H, W, 3) → (T, 3, H, W) float [0,1]
+    video_np = np.stack(frames)  # (T, H, W, 3)
+    sampled_frames = torch.from_numpy(video_np).permute(0, 3, 1, 2).float() / 255.0
+    print(f"[approach5] Video: {sampled_frames.shape[0]} frames @ {fps:.1f} fps → shape {tuple(sampled_frames.shape)}", flush=True)
 
     # --- Build prompt using Qwen3-VL chat template ---
     from transformers import AutoProcessor as HFProcessor
     proc = HFProcessor.from_pretrained(MODEL_ID)
+
     messages = [
         {
             "role": "user",
             "content": [
                 {
                     "type": "video",
-                    "video": sampled_frames,
+                    "video": sampled_frames,  # (T, C, H, W) tensor
                     "fps": 2.0,
                 },
                 {"type": "text", "text": PROMPT},
             ],
         }
     ]
+
+    # Apply chat template → formatted text prompt
     text = proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    _, video_inputs = proc.process_vision_info(messages)
+    # Extract vision info (frames, images) for vLLM's multimodal input
+    image_inputs, video_inputs = proc.process_vision_info(messages)
 
     sampling = SamplingParams(max_tokens=10, temperature=0.0)
 
     print("[approach5] Running inference ...", flush=True)
+    mm_data = {}
+    if video_inputs is not None:
+        mm_data["video"] = video_inputs
+    if image_inputs is not None:
+        mm_data["image"] = image_inputs
+
     t0 = time.perf_counter()
     outputs = llm.generate(
         {
             "prompt": text,
-            "multi_modal_data": {"video": video_inputs},
+            "multi_modal_data": mm_data,
         },
         sampling_params=sampling,
     )
