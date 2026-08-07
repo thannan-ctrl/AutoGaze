@@ -142,43 +142,42 @@ def main():
     fps = 2.0  # effective sampling rate used by loaders above
     print(f"[approach5] Video: {sampled_frames.shape[0]} frames @ {fps:.1f} fps → shape {tuple(sampled_frames.shape)}", flush=True)
 
-    # --- Build prompt using Qwen3-VL chat template ---
+    # --- Build prompt and run inference ---
+    # vLLM's Qwen3-VL processor expects: text prompt with <video> placeholder,
+    # and multi_modal_data={"video": frames} where frames is (T, C, H, W) float32 [0,1].
     from transformers import AutoProcessor as HFProcessor
     proc = HFProcessor.from_pretrained(MODEL_ID)
 
+    # Build chat-template text with a video placeholder
     messages = [
         {
             "role": "user",
             "content": [
-                {
-                    "type": "video",
-                    "video": sampled_frames,  # (T, C, H, W) tensor
-                    "fps": 2.0,
-                },
+                {"type": "video", "video": "placeholder", "nframes": sampled_frames.shape[0]},
                 {"type": "text", "text": PROMPT},
             ],
         }
     ]
+    try:
+        text = proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    except Exception:
+        # Fallback: manual Qwen3-VL chat format
+        n = sampled_frames.shape[0]
+        video_tokens = "<|vision_start|>" + "<|video_pad|>" * n + "<|vision_end|>"
+        text = (
+            f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            f"<|im_start|>user\n{video_tokens}\n{PROMPT}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
 
-    # Apply chat template → formatted text prompt
-    text = proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    # Extract vision info (frames, images) for vLLM's multimodal input
-    image_inputs, video_inputs = proc.process_vision_info(messages)
+    print(f"[approach5] Prompt built ({len(text)} chars). Running inference ...", flush=True)
 
     sampling = SamplingParams(max_tokens=10, temperature=0.0)
-
-    print("[approach5] Running inference ...", flush=True)
-    mm_data = {}
-    if video_inputs is not None:
-        mm_data["video"] = video_inputs
-    if image_inputs is not None:
-        mm_data["image"] = image_inputs
-
     t0 = time.perf_counter()
     outputs = llm.generate(
         {
             "prompt": text,
-            "multi_modal_data": mm_data,
+            "multi_modal_data": {"video": sampled_frames},  # (T, C, H, W) float32
         },
         sampling_params=sampling,
     )
