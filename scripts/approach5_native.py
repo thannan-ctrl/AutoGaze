@@ -63,11 +63,11 @@ elif mode == "autogaze":
     apply_autogaze_patch(mode="autogaze")
 
     # Mock wandb with proper __spec__ so accelerate's find_spec() doesn't error
-    import importlib.util as _ilu
+    import importlib.machinery as _ilm
     if "wandb" not in sys.modules:
         _wm = types.ModuleType("wandb")
         _wm.run = None; _wm.log = lambda *a,**k:None; _wm.init = lambda *a,**k:None
-        _wm.__spec__ = _ilu.ModuleSpec("wandb", None, origin="mock")
+        _wm.__spec__ = _ilm.ModuleSpec("wandb", None, origin="mock")
         sys.modules["wandb"] = _wm
 
     # Run AutoGaze preprocessing
@@ -144,6 +144,9 @@ print("RESULT_JSON:" + json.dumps(result))
 '''
 
 
+TVLIBS = "/home/scratch.thannan_wwfo/miniforge-aarch64/envs/auto_gaze/lib/python3.11/site-packages/torchvision.libs"
+
+
 def run_mode(mode, pruning_rate):
     code = WORKER_CODE.format(
         repo_dir=REPO_DIR, mode=mode, pruning_rate=pruning_rate,
@@ -151,7 +154,12 @@ def run_mode(mode, pruning_rate):
         autogaze_model_id=AUTOGAZE_MODEL_ID,
         qwen_grid=QWEN_GRID_HW, prompt=PROMPT,
     )
-    env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+    ld = os.environ.get("LD_LIBRARY_PATH", "")
+    env = {
+        **os.environ,
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "LD_LIBRARY_PATH": f"{TVLIBS}:{ld}" if ld else TVLIBS,
+    }
     proc = subprocess.run([PYTHON, "-c", code], capture_output=True, text=True, env=env, timeout=600)
     full = proc.stdout + "\n" + proc.stderr
     for line in full.splitlines():
