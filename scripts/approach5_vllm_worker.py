@@ -65,27 +65,80 @@ def main():
     load_ms = (time.perf_counter() - t_load) * 1000
     print(f"[approach5] Model loaded in {load_ms:.0f} ms", flush=True)
 
-    # --- Load video frames with av (PyAV) ---
-    import av
+    # --- Load video frames (multi-fallback: torchcodec → VideoReader → av → ffmpeg) ---
     import numpy as np
     import torch
 
-    container = av.open(VIDEO_PATH)
-    stream = container.streams.video[0]
-    fps = float(stream.average_rate) if stream.average_rate else 30.0
-    # Sample ~2 fps, max 32 frames
-    step = max(1, int(fps / 2.0))
-    frames = []
-    for i, frame in enumerate(container.decode(video=0)):
-        if i % step == 0:
-            frames.append(frame.to_ndarray(format="rgb24"))
-        if len(frames) >= 32:
-            break
-    container.close()
+    def _load_frames_torchcodec(path, target_fps=2.0, max_frames=32):
+        from torchcodec.decoders import VideoDecoder
+        dec = VideoDecoder(path)
+        meta = dec.get_metadata()
+        src_fps = meta.average_fps or 30.0
+        step = max(1, int(src_fps / target_fps))
+        total = meta.num_frames or 1000
+        indices = list(range(0, min(total, max_frames * step), step))[:max_frames]
+        frames = dec.get_frames_at(indices=indices).data  # (T, C, H, W) uint8
+        return frames.float() / 255.0
 
-    # (T, H, W, 3) → (T, 3, H, W) float [0,1]
-    video_np = np.stack(frames)  # (T, H, W, 3)
-    sampled_frames = torch.from_numpy(video_np).permute(0, 3, 1, 2).float() / 255.0
+    def _load_frames_video_reader(path, target_fps=2.0, max_frames=32):
+        from torchvision.io import VideoReader
+        reader = VideoReader(path, "video")
+        meta = reader.get_metadata()
+        src_fps = meta["video"]["fps"][0] if meta and "video" in meta else 30.0
+        step = max(1, int(src_fps / target_fps))
+        frames, i = [], 0
+        for frame in reader:
+            if i % step == 0:
+                frames.append(frame["data"])  # (C, H, W) uint8
+            i += 1
+            if len(frames) >= max_frames:
+                break
+        return torch.stack(frames).float() / 255.0
+
+    def _load_frames_av(path, target_fps=2.0, max_frames=32):
+        import av as _av
+        container = _av.open(path)
+        stream = container.streams.video[0]
+        src_fps = float(stream.average_rate) if stream.average_rate else 30.0
+        step = max(1, int(src_fps / target_fps))
+        raw, i = [], 0
+        for frame in container.decode(video=0):
+            if i % step == 0:
+                raw.append(frame.to_ndarray(format="rgb24"))
+            i += 1
+            if len(raw) >= max_frames:
+                break
+        container.close()
+        arr = np.stack(raw)  # (T, H, W, 3)
+        return torch.from_numpy(arr).permute(0, 3, 1, 2).float() / 255.0
+
+    def _load_frames_ffmpeg(path, target_fps=2.0, max_frames=32, size=(448, 448)):
+        import subprocess, struct
+        w, h = size
+        cmd = ["ffmpeg", "-i", path, "-vf", f"fps={target_fps},scale={w}:{h}",
+               "-frames:v", str(max_frames), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+        proc = subprocess.run(cmd, capture_output=True)
+        data = proc.stdout
+        n = len(data) // (h * w * 3)
+        arr = np.frombuffer(data[:n * h * w * 3], dtype=np.uint8).reshape(n, h, w, 3)
+        return torch.from_numpy(arr.copy()).permute(0, 3, 1, 2).float() / 255.0
+
+    sampled_frames = None
+    for loader_name, loader in [
+        ("torchcodec", _load_frames_torchcodec),
+        ("VideoReader", _load_frames_video_reader),
+        ("av",         _load_frames_av),
+        ("ffmpeg",     _load_frames_ffmpeg),
+    ]:
+        try:
+            sampled_frames = loader(VIDEO_PATH)
+            print(f"[approach5] Video loaded via {loader_name}: {tuple(sampled_frames.shape)}", flush=True)
+            break
+        except Exception as e:
+            print(f"[approach5] {loader_name} failed: {e}", flush=True)
+
+    if sampled_frames is None:
+        raise RuntimeError("All video loaders failed")
     print(f"[approach5] Video: {sampled_frames.shape[0]} frames @ {fps:.1f} fps → shape {tuple(sampled_frames.shape)}", flush=True)
 
     # --- Build prompt using Qwen3-VL chat template ---
