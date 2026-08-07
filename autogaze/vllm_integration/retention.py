@@ -26,21 +26,28 @@ _ctx = threading.local()
 
 class AutoGazeContext:
     """
-    Context manager that stores raw video frames so the retention mask
-    function can access them (AutoGaze needs raw frames, not ViT embeddings).
+    Context manager that passes pre-computed AutoGaze masks to the
+    retention mask function during vLLM's model forward pass.
 
-    Usage (in the vLLM model's _process_video_input before calling super):
-        with AutoGazeContext(pixel_values_flat):
-            embeddings = encode_with_vit(pixel_values_flat)
-            # Inside the ViT call, compute_retention_mask will have access
-            # to the raw frames via _ctx.raw_frames
+    Usage:
+        prep = AutoGazePreprocessor.load("nvidia/AutoGaze")
+        ag_mask, K = prep.compute_retention_mask(raw_frames, target_grid_hw=(rows, cols))
+
+        with AutoGazeContext(ag_mask=ag_mask, K=K):
+            outputs = llm.chat(messages, ...)
+        # During llm.chat, compute_retention_mask will use ag_mask directly.
     """
 
-    def __init__(self, raw_frames: torch.Tensor):
-        self.raw_frames = raw_frames
+    def __init__(
+        self,
+        ag_mask: torch.Tensor | None = None,
+        K: int | None = None,
+    ):
+        # ag_mask: (T*H*W,) bool tensor with True = keep this patch
+        self.payload = {"ag_mask": ag_mask, "K": K} if ag_mask is not None else None
 
     def __enter__(self):
-        _ctx.raw_frames = self.raw_frames
+        _ctx.raw_frames = self.payload
         return self
 
     def __exit__(self, *args):
@@ -163,52 +170,37 @@ def autogaze_retention_mask(
     """
     Full AutoGaze learned retention mask.
 
-    If raw frames are available in AutoGazeContext, uses the actual
-    nvidia/AutoGaze model to select patches.  Otherwise falls back to
-    magnitude-based selection.
+    If a pre-computed AutoGaze mask has been stored via AutoGazeContext,
+    uses it directly (the actual nvidia/AutoGaze model output).
 
-    For production use, call this inside AutoGazeContext:
-        with AutoGazeContext(pixel_values_flat):
-            ...vLLM model forward...
+    Otherwise falls back to magnitude-based selection.
+
+    For production use, pre-compute with AutoGazePreprocessor and store:
+        prep = AutoGazePreprocessor.load("nvidia/AutoGaze")
+        ag_mask, K = prep.compute_retention_mask(raw_frames, target_grid_hw=(rows, cols))
+        with AutoGazeContext(ag_mask, K):
+            outputs = llm.chat(...)
     """
-    raw_frames = get_raw_frames()
+    stored = get_raw_frames()
 
-    if raw_frames is None:
-        # No raw frames in context → fall back to magnitude proxy
-        return magnitude_retention_mask(video_embeds, video_size_thw, spatial_merge_size, q)
+    # If we have a pre-computed AutoGaze mask stored in context, use it
+    if stored is not None and isinstance(stored, dict) and "ag_mask" in stored:
+        ag_mask = stored["ag_mask"]  # (T*H*W,) bool on CPU
+        T, H, W = map(int, video_size_thw)
+        rows, cols = H // spatial_merge_size, W // spatial_merge_size
+        expected_len = T * rows * cols
+        if ag_mask.numel() == expected_len:
+            print(
+                f"[AutoGaze-vLLM] Using pre-computed AutoGaze mask: "
+                f"{ag_mask.sum().item()}/{expected_len} tokens kept",
+                flush=True,
+            )
+            return ag_mask.to(video_embeds.device)
+        else:
+            print(
+                f"[AutoGaze-vLLM] Mask size mismatch: got {ag_mask.numel()}, "
+                f"expected {expected_len}. Falling back to magnitude.",
+                flush=True,
+            )
 
-    ag_model = _load_autogaze()
-    if ag_model is None:
-        return magnitude_retention_mask(video_embeds, video_size_thw, spatial_merge_size, q)
-
-    T, H, W = map(int, video_size_thw)
-    rows, cols = H // spatial_merge_size, W // spatial_merge_size
-    tokens_per_frame = rows * cols
-
-    from vllm.multimodal.evs import compute_retained_tokens_count
-    retain_num = compute_retained_tokens_count(tokens_per_frame, T, q)
-
-    try:
-        device = video_embeds.device
-        with torch.no_grad():
-            # AutoGaze forward pass on raw frames
-            # The model outputs importance scores per patch
-            raw_frames_dev = raw_frames.to(device)
-            ag_output = ag_model(raw_frames_dev)
-            # Expect (T, tokens_per_frame) importance scores
-            if hasattr(ag_output, "logits"):
-                scores = ag_output.logits.view(-1)
-            else:
-                scores = ag_output.view(-1)
-
-        # Ensure first frame is always kept
-        scores[:tokens_per_frame] = float("inf")
-
-        topk_indices = torch.topk(scores, retain_num).indices
-        mask = torch.zeros(video_embeds.shape[0], dtype=torch.bool, device=device)
-        mask[topk_indices] = True
-        return mask
-
-    except Exception as e:
-        print(f"[AutoGaze-vLLM] AutoGaze forward failed: {e}. Falling back to magnitude.")
-        return magnitude_retention_mask(video_embeds, video_size_thw, spatial_merge_size, q)
+    return magnitude_retention_mask(video_embeds, video_size_thw, spatial_merge_size, q)

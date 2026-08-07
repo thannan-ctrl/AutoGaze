@@ -32,6 +32,7 @@ MODES = [
     ("dense",     None),
     ("evs",       PRUNING_RATE),
     ("magnitude", PRUNING_RATE),
+    ("autogaze",  PRUNING_RATE),   # actual nvidia/AutoGaze model, pre-ViT
 ]
 
 
