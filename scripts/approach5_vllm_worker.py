@@ -48,10 +48,13 @@ def main():
     # --- Build vLLM engine ---
     from vllm import LLM, SamplingParams
 
-    # video_pruning_rate is a top-level vLLM engine param (not mm_processor_kwargs)
+    # video_pruning_rate is a top-level vLLM engine param (not mm_processor_kwargs).
+    # enforce_eager=True required when pruning is active: dynamic post-ViT token
+    # reduction produces variable-length sequences that break static CUDA graph capture.
     extra_kwargs = {}
     if pruning_rate is not None and mode != "dense":
         extra_kwargs["video_pruning_rate"] = pruning_rate
+        extra_kwargs["enforce_eager"] = True  # skip CUDA graph capture
 
     print(f"[approach5] Loading {MODEL_ID} ...", flush=True)
     t_load = time.perf_counter()
