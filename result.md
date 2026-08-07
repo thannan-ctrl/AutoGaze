@@ -92,7 +92,20 @@ processor_output_keys = [
 
 ## Approach 4 — Two-process split (embedding service + LLM)
 
-*Results pending — running now.*
+**Video:** local 448×448, 128 frames | Ratios tested: {0.25, 0.5, 1.0}
+
+| ratio | K tokens | Generate (ms) | vs Dense | Answer |
+|:---:|---:|---:|:---:|:---:|
+| 0.25 | 5,690 | 3,589 | **−75%** | A. |
+| 0.50 | 11,195 | 9,439 | **−50%** | A. |
+| 1.00 | 22,352 | 25,113 | — (dense) | A. |
+
+**Key finding:**
+- Dense baseline: **22,352 tokens / 25.1s**
+- ratio=0.25: **5,690 tokens / 3.6s** → **7× speedup in generate time**
+- All ratios give the same answer
+- Embeddings saved to `embeddings/visual_tokens_ratio{r}.pt` for inspection
+- Vision tower hook did not fire — NVILA merges visual tokens internally before a hookable boundary
 
 ---
 
@@ -133,3 +146,60 @@ processor_output_keys = [
 | Can the ViT skip patches using a gather op without retraining? | Prototype sparse SigLIP forward |
 | What is the AutoGaze selector latency vs ViT savings? | Add timing hook in approach 2 |
 | Does accuracy hold on full VQA benchmarks (not just 1 question)? | Run EgoSchema / Video-MME |
+
+---
+
+--
+
+--
+
+--
+
+--
+
+--
+
+--
+
+--
+
+--
+
+--
+
+## Approach 5 — AutoGaze × vLLM Integration ✅
+
+**Model:** `Qwen/Qwen3-VL-2B-Instruct` in NVIDIA vLLM Docker (v0.26.0+a404e7bc, GB200 arm64)  
+**Container:** `gitlab-master.nvidia.com:5005/dl/dgx/vllm:main-py3.60784172-devel-arm64`  
+**Video:** `assets/example_input.mp4`  
+**Pruning rate:** 0.5
+
+| Mode | Tokens | vs Dense | Latency | Answer |
+|---|---:|:---:|---:|:---:|
+| dense | 670 | — | ~17s | C |
+| evs (cosine similarity) | 376 | **−44%** | ~17s | C |
+| magnitude (AutoGaze-inspired) | 376 | **−44%** | ~17s | C |
+
+**Key findings:**
+1. **AutoGaze patch confirmed** — `[AutoGaze-vLLM] compute_retention_mask → magnitude` fires before model load
+2. **44% token reduction** at pruning_rate=0.5: 670 → 376 tokens, same answer quality
+3. EVS and AutoGaze-magnitude select equal numbers of tokens; quality difference needs full VQA benchmark
+4. `enforce_eager=True` required: dynamic post-ViT token reduction breaks static CUDA graph capture
+5. Dense 670-token baseline from prior run (dense failed attempt 10 due to HF API rate limiting)
+
+**Integration code** (`autogaze/vllm_integration/`):
+```python
+from autogaze.vllm_integration.patch import apply_autogaze_patch
+apply_autogaze_patch(mode="magnitude")   # replaces compute_retention_mask before model load
+
+llm = LLM("Qwen/Qwen3-VL-2B-Instruct", video_pruning_rate=0.5, enforce_eager=True)
+outputs = llm.chat([{"role":"user","content":[
+    {"type":"video_url","video_url":{"url":"file:///path/to/video.mp4","fps":2.0}},
+    {"type":"text","text":prompt}]}])
+```
+
+**Production path:**
+1. Move AutoGaze selector pre-ViT (processor stage) → save ViT compute too, not just LLM
+2. Use `AutoGazeContext` to pass raw frames to the retention mask function  
+3. Report exact K to vLLM scheduler via `ModalityInput.token_count` (new field, ~50 LOC PR)
+4. Re-enable CUDA graphs with static sequence length K
