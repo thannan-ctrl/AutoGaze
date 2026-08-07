@@ -37,6 +37,22 @@ _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
+# Mock training-only deps that autogaze imports at module level but doesn't
+# need for inference. Do this before any autogaze import.
+import types as _types
+
+def _mock_if_missing(name: str, attrs: dict | None = None):
+    if name not in sys.modules:
+        m = _types.ModuleType(name)
+        if attrs:
+            for k, v in attrs.items():
+                setattr(m, k, v)
+        sys.modules[name] = m
+
+_mock_if_missing("wandb", {"run": None, "log": lambda *a, **k: None, "init": lambda *a, **k: None})
+_mock_if_missing("wandb.sdk", {})
+_mock_if_missing("wandb.sdk.lib", {})
+
 
 class AutoGazePreprocessor:
     """Wraps the AutoGaze model for vLLM retention-mask computation."""
