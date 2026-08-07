@@ -48,9 +48,10 @@ def main():
     # --- Build vLLM engine ---
     from vllm import LLM, SamplingParams
 
-    mm_processor_kwargs = {}
+    # video_pruning_rate is a top-level vLLM engine param (not mm_processor_kwargs)
+    extra_kwargs = {}
     if pruning_rate is not None and mode != "dense":
-        mm_processor_kwargs["video_pruning_rate"] = pruning_rate
+        extra_kwargs["video_pruning_rate"] = pruning_rate
 
     print(f"[approach5] Loading {MODEL_ID} ...", flush=True)
     t_load = time.perf_counter()
@@ -60,8 +61,8 @@ def main():
         gpu_memory_utilization=0.7,
         max_model_len=8192,
         limit_mm_per_prompt={"video": 1},
-        mm_processor_kwargs=mm_processor_kwargs if mm_processor_kwargs else None,
         allowed_local_media_path="/workspace",
+        **extra_kwargs,
     )
     load_ms = (time.perf_counter() - t_load) * 1000
     print(f"[approach5] Model loaded in {load_ms:.0f} ms", flush=True)
