@@ -27,6 +27,8 @@ RESULTS_FILE = os.path.join(REPO_DIR, "approach5_results.json")
 
 VLLM_IMAGE = "gitlab-master.nvidia.com:5005/dl/dgx/vllm:main-py3.60784172-devel-arm64"
 PRUNING_RATE = 0.5
+AUTOGAZE_PYTHON = "/home/scratch.thannan_wwfo/miniforge-aarch64/envs/auto_gaze/bin/python"
+AUTOGAZE_MASK_PATH = "/tmp/ag_mask_real.pt"
 
 MODES = [
     ("dense",     None),
@@ -34,6 +36,23 @@ MODES = [
     ("magnitude", PRUNING_RATE),
     ("autogaze",  PRUNING_RATE),   # actual nvidia/AutoGaze model, pre-ViT
 ]
+
+
+def precompute_autogaze_mask(pruning_rate: float) -> None:
+    """Run AutoGaze preprocessing outside Docker using the auto_gaze conda env."""
+    video_path = os.path.join(REPO_DIR, "assets", "example_input.mp4")
+    cmd = [
+        AUTOGAZE_PYTHON,
+        os.path.join(REPO_DIR, "scripts", "run_autogaze_preprocess.py"),
+        "--video", video_path,
+        "--output", AUTOGAZE_MASK_PATH,
+        "--gazing-ratio", str(pruning_rate),
+    ]
+    print(f"\n[autogaze] Pre-computing mask with auto_gaze env ...", flush=True)
+    result = subprocess.run(cmd, capture_output=False, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"AutoGaze preprocessing failed (exit {result.returncode})")
+    print(f"[autogaze] Mask saved to {AUTOGAZE_MASK_PATH}", flush=True)
 
 
 def run_mode_in_docker(mode: str, pruning_rate: float | None) -> dict:
@@ -44,7 +63,9 @@ def run_mode_in_docker(mode: str, pruning_rate: float | None) -> dict:
         "--shm-size", "16g",
         "-v", f"{HF_CACHE}:/root/.cache/huggingface",
         "-v", f"{REPO_DIR}:/workspace/AutoGaze",
+        "-v", f"{AUTOGAZE_MASK_PATH}:{AUTOGAZE_MASK_PATH}",
         "-e", f"REPO_DIR=/workspace/AutoGaze",
+        "-e", f"AUTOGAZE_MASK_PATH={AUTOGAZE_MASK_PATH}",
         "-e", f"HF_HOME=/root/.cache/huggingface",
         "-e", "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         VLLM_IMAGE,
@@ -138,6 +159,8 @@ def main():
         if i > 0:
             import time as _t; _t.sleep(5)  # brief pause so GPU resets between containers
         try:
+            if mode == "autogaze":
+                precompute_autogaze_mask(pr)
             r = run_mode_in_docker(mode, pr)
             results.append(r)
             print(f"\n  ✓ {mode}: {r['num_prompt_tokens']} tokens, {r['elapsed_ms']:.0f} ms, answer={r['answer']}")
