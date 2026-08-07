@@ -134,7 +134,9 @@ def main():
     print(f"Video:  {REPO_DIR}/assets/example_input.mp4\n")
 
     results = []
-    for mode, pr in MODES:
+    for i, (mode, pr) in enumerate(MODES):
+        if i > 0:
+            import time as _t; _t.sleep(5)  # brief pause so GPU resets between containers
         try:
             r = run_mode_in_docker(mode, pr)
             results.append(r)

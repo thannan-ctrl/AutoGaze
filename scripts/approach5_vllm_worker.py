@@ -91,6 +91,12 @@ def main():
     ag_K = None
 
     if mode == "autogaze":
+        # Install AutoGaze deps that may be missing from the vLLM container
+        import subprocess
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "omegaconf", "einops", "timm", "-q"],
+            check=True
+        )
         # Load the real AutoGaze model and preprocess the video
         from autogaze.vllm_integration.autogaze_preprocess import AutoGazePreprocessor
         from autogaze.vllm_integration.patch import apply_autogaze_patch
