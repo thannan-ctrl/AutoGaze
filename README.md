@@ -55,7 +55,7 @@ Tested on: `ipp2-2371`, H100 PCIe, Driver 580.x, CUDA 13.0
 
 ```bash
 # 1. Create and activate conda environment
-conda create -n auto_gaze python=3.11
+conda create -y -n auto_gaze python=3.11
 conda activate auto_gaze
 
 # 2. Install uv
@@ -65,7 +65,7 @@ pip install uv
 pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu130
 
 # 4. Install flash-attn (precompiled wheel available for x86_64 + cu130)
-conda install flash-attn
+conda install flash-attn -y
 
 # 5. Install remaining dependencies
 pip install \
@@ -75,6 +75,10 @@ pip install \
   tqdm \
   "transformers~=4.51" \
   pillow numpy omegaconf matplotlib einops av imageio
+
+pip install opencv-python-headless
+
+pip install accelerate
 
 # 6. Install AutoGaze in editable mode (deps already installed above)
 pip install -e . --no-deps
