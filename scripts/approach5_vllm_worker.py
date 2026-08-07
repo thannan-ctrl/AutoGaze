@@ -61,6 +61,7 @@ def main():
         max_model_len=8192,
         limit_mm_per_prompt={"video": 1},
         mm_processor_kwargs=mm_processor_kwargs if mm_processor_kwargs else None,
+        allowed_local_media_path="/workspace",
     )
     load_ms = (time.perf_counter() - t_load) * 1000
     print(f"[approach5] Model loaded in {load_ms:.0f} ms", flush=True)
