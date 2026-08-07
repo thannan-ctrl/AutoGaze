@@ -308,7 +308,12 @@ class LlamaForCausalLM_MultiTokenPred(LlamaPreTrainedModel, GenerationMixin):
         batch_size, cur_len = input_ids.shape
         this_peer_finished = False
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
-        model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs) if LOW_TRANSFORMERS_VERSION else self._get_initial_cache_position(cur_len, input_ids.device, model_kwargs)
+        if hasattr(self, '_get_initial_cache_position'):
+            model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs) if LOW_TRANSFORMERS_VERSION else self._get_initial_cache_position(cur_len, input_ids.device, model_kwargs)
+        else:
+            # transformers 5.x removed _get_initial_cache_position; compute cache_position manually
+            if "cache_position" not in model_kwargs:
+                model_kwargs["cache_position"] = torch.arange(cur_len, device=input_ids.device)
 
         model_forward = self.__call__
         if isinstance(model_kwargs.get("past_key_values"), Cache):
