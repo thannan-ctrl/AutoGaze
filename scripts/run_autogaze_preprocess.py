@@ -18,17 +18,6 @@ import sys
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_DIR)
 
-# Mock wandb (training-only dependency)
-import types
-def _mock(name, **attrs):
-    if name not in sys.modules:
-        m = types.ModuleType(name)
-        for k, v in attrs.items():
-            setattr(m, k, v)
-        sys.modules[name] = m
-
-_mock("wandb", run=None, log=lambda *a, **k: None, init=lambda *a, **k: None)
-
 import torch
 import torch.nn.functional as F
 

@@ -311,9 +311,15 @@ class LlamaForCausalLM_MultiTokenPred(LlamaPreTrainedModel, GenerationMixin):
         if hasattr(self, '_get_initial_cache_position'):
             model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs) if LOW_TRANSFORMERS_VERSION else self._get_initial_cache_position(cur_len, input_ids.device, model_kwargs)
         else:
-            # transformers 5.x removed _get_initial_cache_position; compute cache_position manually
+            # transformers 5.x: compute cache_position from inputs_embeds length if available
+            # (when inputs_embeds is passed, input_ids is a dummy (B,0) tensor so cur_len=0)
             if "cache_position" not in model_kwargs:
-                model_kwargs["cache_position"] = torch.arange(cur_len, device=input_ids.device)
+                embed_len = model_kwargs.get("inputs_embeds", None)
+                if embed_len is not None:
+                    embed_len = embed_len.shape[1]
+                else:
+                    embed_len = cur_len
+                model_kwargs["cache_position"] = torch.arange(embed_len, device=input_ids.device)
 
         model_forward = self.__call__
         if isinstance(model_kwargs.get("past_key_values"), Cache):
@@ -336,8 +342,11 @@ class LlamaForCausalLM_MultiTokenPred(LlamaPreTrainedModel, GenerationMixin):
         is_first_token = True
         final_past_key_values = None
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
-            # prepare model inputs
-            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            # prepare model inputs; pass is_first_iteration=True on the first prefill so
+            # transformers 5.x uses inputs_embeds instead of the dummy empty input_ids
+            model_inputs = self.prepare_inputs_for_generation(
+                input_ids, is_first_iteration=is_first_token, **model_kwargs
+            )
 
             # prepare variable output controls (note: some models won't accept all output controls)
             model_inputs.update({"output_attentions": output_attentions} if output_attentions else {})
