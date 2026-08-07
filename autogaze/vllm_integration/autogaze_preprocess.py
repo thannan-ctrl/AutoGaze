@@ -71,6 +71,12 @@ class AutoGazePreprocessor:
     def load(cls, model_id: str = "nvidia/AutoGaze", device: str = "cuda") -> "AutoGazePreprocessor":
         from autogaze.models.autogaze import AutoGaze
         print(f"[AutoGazePreprocessor] Loading {model_id} ...", flush=True)
+
+        # transformers 5.x renamed _tied_weights_keys → all_tied_weights_keys (as a dict).
+        # Patch the class for backward compat with the local AutoGaze code.
+        if not hasattr(AutoGaze, "all_tied_weights_keys"):
+            AutoGaze.all_tied_weights_keys = property(lambda self: {})
+
         ag = AutoGaze.from_pretrained(model_id)
         ag = ag.to(device).eval()
         print("[AutoGazePreprocessor] Loaded.", flush=True)
