@@ -139,6 +139,7 @@ def main():
 
     if sampled_frames is None:
         raise RuntimeError("All video loaders failed")
+    fps = 2.0  # effective sampling rate used by loaders above
     print(f"[approach5] Video: {sampled_frames.shape[0]} frames @ {fps:.1f} fps → shape {tuple(sampled_frames.shape)}", flush=True)
 
     # --- Build prompt using Qwen3-VL chat template ---
