@@ -50,14 +50,6 @@ pruning_rate = {pruning_rate}
 video_path = {video_path!r}
 model_id = {model_id!r}
 
-# ── Mock wandb (training dep) ────────────────────────────────────────────
-def _mock(name, **attrs):
-    if name not in sys.modules:
-        m = types.ModuleType(name)
-        for k, v in attrs.items(): setattr(m, k, v)
-        sys.modules[name] = m
-_mock("wandb", run=None, log=lambda *a,**k:None, init=lambda *a,**k:None)
-
 # ── Apply AutoGaze patch ─────────────────────────────────────────────────
 ag_mask = None
 ag_K = None
@@ -69,6 +61,14 @@ if mode == "magnitude":
 elif mode == "autogaze":
     from autogaze.vllm_integration.patch import apply_autogaze_patch
     apply_autogaze_patch(mode="autogaze")
+
+    # Mock wandb with proper __spec__ so accelerate's find_spec() doesn't error
+    import importlib.util as _ilu
+    if "wandb" not in sys.modules:
+        _wm = types.ModuleType("wandb")
+        _wm.run = None; _wm.log = lambda *a,**k:None; _wm.init = lambda *a,**k:None
+        _wm.__spec__ = _ilu.ModuleSpec("wandb", None, origin="mock")
+        sys.modules["wandb"] = _wm
 
     # Run AutoGaze preprocessing
     print("[approach5] Running AutoGaze preprocessing ...", flush=True)
