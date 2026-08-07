@@ -75,11 +75,13 @@ def main():
             "role": "user",
             "content": [
                 {
-                    "type": "video",
-                    "video": video_url,
-                    "fps": 2.0,
-                    "max_pixels": 448 * 448,
-                    "nframes": 32,
+                    "type": "video_url",
+                    "video_url": {
+                        "url": video_url,
+                        "fps": 2.0,
+                        "max_pixels": 448 * 448,
+                        "nframes": 32,
+                    },
                 },
                 {"type": "text", "text": PROMPT},
             ],
