@@ -60,8 +60,8 @@ PROMPT = (
     "Please answer directly with the letter of the correct answer."
 )
 
-QWEN_GRID_HW     = (16, 16)   # post-merge: for autogaze mask
-QWEN_VIT_GRID_HW = (32, 32)   # pre-merge:  for sparse_vit mask
+QWEN_GRID_HW     = (14, 14)   # post-merge: 28px/patch → 14×14 after 2×2 merge
+QWEN_VIT_GRID_HW = (28, 28)   # pre-merge:  392px / 14px_patch = 28 patches/side
 QWEN_MERGE_FACTOR = 4          # 2×2 spatial merge
 
 
