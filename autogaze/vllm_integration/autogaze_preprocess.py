@@ -96,6 +96,7 @@ class AutoGazePreprocessor:
         frames_224: torch.Tensor,  # (T, C, 224, 224) normalized
         gazing_ratio: float = 0.5,
         task_loss_requirement: float | None = None,
+        seed: int = 42,
     ) -> torch.Tensor:
         """
         Run AutoGaze on preprocessed frames.
@@ -107,6 +108,9 @@ class AutoGazePreprocessor:
         frames_224 = frames_224.to(device)
         T = frames_224.shape[0]
         max_chunk = self.MAX_FRAMES_PER_CHUNK
+
+        # Fix random seed for reproducible K selection across runs
+        torch.manual_seed(seed)
 
         # AutoGaze processes in temporal chunks of max_chunk frames
         all_masks = []
@@ -142,6 +146,7 @@ class AutoGazePreprocessor:
         target_grid_hw: tuple[int, int],  # (H_grid, W_grid) of downstream ViT after merge
         gazing_ratio: float = 0.5,
         task_loss_requirement: float | None = None,
+        seed: int = 42,
     ) -> tuple[torch.Tensor, int]:
         """
         Full pipeline: raw frames → AutoGaze → retention mask for vLLM.
@@ -164,7 +169,7 @@ class AutoGazePreprocessor:
         frames_224 = self.preprocess_frames(raw_frames.to(device))
 
         # Step 2: run AutoGaze → (T, 14, 14) bool mask
-        ag_mask_14 = self.run_autogaze(frames_224, gazing_ratio, task_loss_requirement)
+        ag_mask_14 = self.run_autogaze(frames_224, gazing_ratio, task_loss_requirement, seed=seed)
 
         # Step 3: bilinear upsample (T, 14, 14) → (T, H_grid, W_grid)
         ag_mask_float = ag_mask_14.float().unsqueeze(0)  # (1, T, 14, 14)

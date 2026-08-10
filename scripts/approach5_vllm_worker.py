@@ -132,10 +132,6 @@ def main():
         print(f"[approach5] Loaded AutoGaze ViT-level mask: K_vit={K_vit}, K_merged≈{K_merged}", flush=True)
         from autogaze.vllm_integration.patch import apply_autogaze_patch
         apply_autogaze_patch(mode="autogaze")
-        # Class-level sparse ViT patch — must run BEFORE LLM() so the patch is
-        # inherited by the EngineCore subprocess (vLLM ≥0.24 V1 engine).
-        from autogaze.vllm_integration.sparse_vit import patch_sparse_vit as _patch_cls
-        _patch_cls(llm=None)
 
     elif mode == "magnitude":
         from autogaze.vllm_integration.patch import apply_autogaze_patch
@@ -143,6 +139,13 @@ def main():
 
     # ── Build vLLM engine ──────────────────────────────────────────────────────
     from vllm import LLM, SamplingParams
+
+    # Class-level sparse ViT patch — apply AFTER `from vllm import LLM`
+    # so vLLM's lazy model-module imports are already resolved, but BEFORE
+    # LLM() instantiation so the class patch is inherited by EngineCore.
+    if mode == "sparse_vit":
+        from autogaze.vllm_integration.sparse_vit import patch_sparse_vit as _patch_cls
+        _patch_cls(llm=None)
 
     extra_kwargs = {}
     if mode != "dense":
