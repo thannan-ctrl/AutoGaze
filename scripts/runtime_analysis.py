@@ -33,15 +33,20 @@ VLLM_IMAGE = "nvcr.io/nvidia/vllm:26.07-py3"
 
 def run_docker(mode: str, pruning_rate: float, reps: int,
                gazing_ratio: float = 0.245,
-               max_frames: int = 32, fps: float = 2.0) -> dict:
+               max_frames: int = 32, fps: float = 2.0,
+               video_path: str | None = None) -> dict:
     """
     Run one mode in a Docker container.
     Returns the parsed RESULT_JSON dict augmented with wall_ms.
     """
+    # Resolve video path: default to example_input.mp4, allow override
+    docker_video = video_path or "/workspace/AutoGaze/assets/example_input.mp4"
+
     env_vars = [
         "-e", f"REPO_DIR=/workspace/AutoGaze",
         "-e", f"HF_HOME=/root/.cache/huggingface",
         "-e", "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+        "-e", f"VIDEO_PATH={docker_video}",
     ]
     vol_mounts = [
         "-v", f"{HF_CACHE}:/root/.cache/huggingface",
@@ -58,7 +63,7 @@ def run_docker(mode: str, pruning_rate: float, reps: int,
 
     if mode == "sparse_vit":
         worker_args += [
-            "--video", "/workspace/AutoGaze/assets/example_input.mp4",
+            "--video", docker_video,
             "--gazing-ratio", str(gazing_ratio),
         ]
 
@@ -211,9 +216,11 @@ def main():
                         choices=["dense", "dense_eager", "evs", "magnitude", "autogaze", "sparse_vit"],
                         help="Modes to benchmark")
     parser.add_argument("--max-frames", type=int, default=32,
-                        help="Max video frames (use 64 for full video)")
+                        help="Max video frames to sample")
     parser.add_argument("--fps", type=float, default=2.0,
-                        help="Frame sampling rate (use 25.0 for all frames)")
+                        help="Frame sampling rate")
+    parser.add_argument("--video", default=None,
+                        help="Docker-side video path (default: assets/example_input.mp4)")
     args = parser.parse_args()
 
     pruning_rate = args.pruning_rate
@@ -240,6 +247,7 @@ def main():
                 gazing_ratio=args.gazing_ratio,
                 max_frames=args.max_frames,
                 fps=args.fps,
+                video_path=args.video,
             )
             results.append(r)
             tok  = r.get("num_prompt_tokens", "?")

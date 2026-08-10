@@ -49,7 +49,11 @@ def _ensure_deps():
         subprocess.run([sys.executable, "-m", "pip", "install", "-q"] + missing, check=True)
 
 MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
-VIDEO_PATH = os.path.join(REPO_DIR, "assets", "example_input.mp4")
+# Default video; override with --video for a different path
+VIDEO_PATH = os.environ.get(
+    "VIDEO_PATH",
+    os.path.join(REPO_DIR, "assets", "example_input.mp4"),
+)
 PROMPT = (
     "Question: What does the white text on the green road sign say?\n"
     "A. Hampden St\nB. Hampden Ave\nC. HampdenBlvd\nD. Hampden Rd\n"
