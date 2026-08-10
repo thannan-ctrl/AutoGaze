@@ -42,18 +42,16 @@ question. Both correct. Run B is 21% faster than EVS with 80% fewer tokens than 
 
 ## Architecture
 
+**Single environment (recommended)** — AutoGaze and vLLM both run inside Docker:
+
 ```
-OUTSIDE DOCKER  (auto_gaze conda env, transformers 4.x)
+INSIDE DOCKER  (nvcr.io/nvidia/vllm:26.07-py3)
 ────────────────────────────────────────────────────────
   video frames
     ↓ AutoGaze (ShallowVideoConvNet + LLaMA-4L)
   gazing_mask (T, 14, 14)  ← per-frame, task-driven early stopping
     ↓ bilinear upsample → ViT patch grid (32×32)
-  ag_mask_vit.pt  ──────────────────────────────────────┐
-                                                         │ file on disk
-INSIDE DOCKER  (nvcr.io/nvidia/vllm:26.07-py3)          │
-────────────────────────────────────────────────────────┘
-  from vllm import LLM
+
   apply_autogaze_patch()       ← monkey-patches vllm.multimodal.evs
   patch_sparse_vit(llm=None)   ← class-level patch before LLM() [vLLM V1]
   LLM(video_pruning_rate=0.245, enforce_eager=True)
@@ -62,11 +60,14 @@ INSIDE DOCKER  (nvcr.io/nvidia/vllm:26.07-py3)          │
 
   pixel_values (T × 32×32 patches)
     ↓ patch_embed    [all N — cheap conv]
-    ↓ GATHER K       [from ag_mask_vit.pt]      ← K varies per video/frame
+    ↓ GATHER K       [AutoGaze mask]        ← K varies per video/frame
     ↓ blocks(K)      [O(K²) vs dense O(N²)]
     ↓ merger         [K → K/4 merged tokens]
     ↓ LLM            [K/4 visual tokens → answer]
 ```
+
+**Legacy two-environment flow** (still supported via `--mask`): compute the AutoGaze mask
+outside Docker with `scripts/run_autogaze_preprocess.py`, save to a `.pt` file, pass it in.
 
 **Three things patched in vLLM:**
 
@@ -80,19 +81,24 @@ INSIDE DOCKER  (nvcr.io/nvidia/vllm:26.07-py3)          │
 
 ## Quick start
 
+**Single environment (no conda needed):**
 ```bash
-# Step 1 — compute AutoGaze mask (auto_gaze env, outside Docker)
-/path/to/auto_gaze/python scripts/run_autogaze_preprocess.py \
-    --video assets/example_input.mp4 \
-    --output /tmp/ag_mask_vit.pt \
-    --grid-hw 32 32 \
-    --gazing-ratio 0.245
+# Benchmark dense vs EVS vs sparse_vit — AutoGaze runs inside Docker
+python scripts/runtime_analysis.py --modes dense evs sparse_vit --single-env --reps 3
 
-# Step 2 — benchmark all three modes (launches Docker automatically)
-python scripts/runtime_analysis.py --modes dense evs sparse_vit --reps 3
-
-# Step 3 — sweep a specific ratio, reuse cached dense/EVS baseline
+# Tune gazing ratio
 python scripts/compare_sparse_vit_ratio.py --gazing-ratio 0.245 --reps 3
+```
+
+**Legacy two-environment flow** (separate conda env for preprocessing):
+```bash
+# Step 1 — compute mask outside Docker
+/path/to/auto_gaze/python scripts/run_autogaze_preprocess.py \
+    --video assets/example_input.mp4 --output /tmp/ag_mask_vit.pt \
+    --grid-hw 32 32 --gazing-ratio 0.245
+
+# Step 2 — benchmark (Docker picks up the mask automatically)
+python scripts/runtime_analysis.py --modes dense evs sparse_vit --reps 3
 ```
 
 ---

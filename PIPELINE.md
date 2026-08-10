@@ -4,16 +4,22 @@ End-to-end code trace from raw video to LLM answer.
 
 ---
 
-## Why two environments
+## Environments
 
-AutoGaze requires `transformers 4.x`; vLLM requires `transformers 5.x`. They conflict,
-so the pipeline splits across two processes with a file as the handoff:
+AutoGaze and vLLM run in the **same Docker container**. The original split existed because
+three files had dead `from omegaconf import OmegaConf` module-level imports — omegaconf
+isn't in the vLLM image, so the module failed to load before any model code ran. Removing
+those imports (and making `wandb`/`loguru` lazy inside the training-only functions that use
+them) was sufficient. The Docker image ships `ffmpeg` at `/opt/ffmpeg-safe/bin`; `worker.py`
+adds it to PATH on startup.
 
+**Run:**
+```bash
+python scripts/runtime_analysis.py --modes dense evs sparse_vit --single-env --reps 3
 ```
-auto_gaze conda env                     vLLM Docker container
-(transformers 4.x)    ag_mask_vit.pt   (transformers 5.x)
-  AutoGaze model    ──────────────────►  Qwen3-VL + sparse ViT
-```
+
+A legacy two-env flow (compute mask outside Docker with `run_autogaze_preprocess.py`, pass
+via `--mask`) is still supported for cases where preprocessing runs on a different machine.
 
 ---
 
