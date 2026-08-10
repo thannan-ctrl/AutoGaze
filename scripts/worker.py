@@ -187,14 +187,16 @@ def main():
         apply_autogaze_patch(mode="magnitude")
 
     # ── Build vLLM engine ──────────────────────────────────────────────────────
-    from vllm import LLM, SamplingParams
 
-    # Class-level sparse ViT patch — apply AFTER `from vllm import LLM`
-    # so vLLM's lazy model-module imports are already resolved, but BEFORE
-    # LLM() instantiation so the class patch is inherited by EngineCore.
+    # Install the import hook BEFORE `from vllm import LLM` so that when vLLM
+    # forks the EngineCore subprocess, the child inherits sys.meta_path and
+    # the hook fires when the child imports qwen3_vl — patching the class
+    # before it is instantiated, without any cross-process class patching.
     if mode == "sparse_vit":
-        from autogaze.vllm_integration.sparse_vit import patch_sparse_vit as _patch_cls
-        _patch_cls(llm=None)
+        from autogaze.vllm_integration.sparse_vit import install_import_hook
+        install_import_hook()
+
+    from vllm import LLM, SamplingParams
 
     extra_kwargs = {}
     if mode == "dense_eager":

@@ -516,6 +516,73 @@ def patch_sparse_vit(llm=None) -> Optional[object]:
     return encoder
 
 
+def install_import_hook() -> None:
+    """
+    Install a Python meta-path import hook that patches Qwen2_5VLVisionTransformer
+    the moment its module is imported — in ANY process that inherits this hook.
+
+    On Linux, vLLM forks the EngineCore subprocess after LLM() is called.
+    The child inherits sys.meta_path, so when the child later imports
+    vllm.model_executor.models.qwen3_vl it gets the patched class automatically,
+    without needing any class-level patching from the parent after fork.
+
+    Must be called BEFORE ``from vllm import LLM`` so that the fork occurs
+    after the hook is installed.
+
+    This is the reliable approach for vLLM V1 (EngineCore subprocess):
+        import_hook installed → LLM() forks → child imports qwen3_vl
+                                            → hook fires → class patched
+                                            → instance.forward() uses patched class
+    """
+    import sys
+
+    _TARGET_MODULES = {
+        "vllm.model_executor.models.qwen3_vl":   "Qwen2_5VLVisionTransformer",
+        "vllm.model_executor.models.qwen2_5_vl": "Qwen2_5VLVisionTransformer",
+        "vllm.model_executor.models.qwen2_vl":   "Qwen2VLVisionTransformer",
+    }
+
+    class _SparseViTImportHook:
+        def find_module(self, fullname, path=None):
+            return self if fullname in _TARGET_MODULES else None
+
+        def load_module(self, fullname):
+            import importlib
+            # Avoid infinite recursion: remove self, import normally, re-add.
+            sys.meta_path.remove(self)
+            try:
+                mod = importlib.import_module(fullname)
+            finally:
+                sys.meta_path.insert(0, self)
+
+            # Patch the visual encoder class in-place
+            cls_name = _TARGET_MODULES[fullname]
+            cls = getattr(mod, cls_name, None)
+            if cls is not None and id(cls) not in _PATCHED_ENCODERS:
+                original_forward = cls.forward
+                _PATCHED_ENCODERS[id(cls)] = original_forward
+
+                def _hook_forward(self_enc, *args, **kwargs):
+                    payload = get_sparse_payload()
+                    if payload is None:
+                        return original_forward(self_enc, *args, **kwargs)
+                    bound = original_forward.__get__(self_enc, type(self_enc))
+                    return _sparse_vit_forward(self_enc, bound, payload, *args, **kwargs)
+
+                cls.forward = _hook_forward
+                print(
+                    f"[SparseViT] Import hook patched {cls_name}.forward "
+                    f"(module={fullname})",
+                    flush=True,
+                )
+            return mod
+
+    # Only install once
+    if not any(type(h).__name__ == "_SparseViTImportHook" for h in sys.meta_path):
+        sys.meta_path.insert(0, _SparseViTImportHook())
+        print("[SparseViT] Import hook installed — will patch on first qwen3_vl import.", flush=True)
+
+
 def restore_sparse_vit(llm) -> None:
     """Restore the original visual encoder forward."""
     encoder = _find_visual_encoder(llm)
