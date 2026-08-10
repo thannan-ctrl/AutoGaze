@@ -3,39 +3,56 @@ Retention mask implementations for AutoGaze × vLLM integration.
 
 Provides drop-in replacements for vLLM's EVS compute_retention_mask.
 
-Three modes:
+Three post-ViT modes:
   "evs"        — original EVS (cosine similarity between frames) — baseline
   "magnitude"  — magnitude-based importance (proof-of-concept, no extra model)
   "autogaze"   — full AutoGaze learned selection (requires nvidia/AutoGaze weights
                  AND raw frames stored in context via AutoGazeContext)
+
+Task 1 — Adaptive K:
+  autogaze_retained_tokens_count replaces vLLM's fixed compute_retained_tokens_count.
+  When AutoGazeContext carries K, vLLM uses that count instead of the fixed formula,
+  enabling per-video token budgets rather than a uniform ratio across all videos.
+
+Tasks 2+3 — Sparse ViT pass-through:
+  When AutoGazeContext is used with K set but ag_mask=None (sparse ViT mode),
+  autogaze_retention_mask returns an identity mask (all-True) because patch
+  selection already happened inside the ViT via gather op — no post-ViT pruning.
 """
 from __future__ import annotations
 
-import contextlib
 import threading
-from typing import TYPE_CHECKING
 
 import torch
 
-if TYPE_CHECKING:
-    pass
-
-# Thread-local storage for raw frames (needed for full AutoGaze mode)
 _ctx = threading.local()
+
+# Capture original vLLM function before any monkey-patching so fallbacks
+# never recurse into our patched version.
+try:
+    from vllm.multimodal.evs import compute_retained_tokens_count as _vllm_retained_count
+except ImportError:
+    _vllm_retained_count = None
 
 
 class AutoGazeContext:
     """
-    Context manager that passes pre-computed AutoGaze masks to the
-    retention mask function during vLLM's model forward pass.
+    Context manager that passes AutoGaze data into vLLM's retention hooks.
 
-    Usage:
-        prep = AutoGazePreprocessor.load("nvidia/AutoGaze")
-        ag_mask, K = prep.compute_retention_mask(raw_frames, target_grid_hw=(rows, cols))
+    Two modes:
 
-        with AutoGazeContext(ag_mask=ag_mask, K=K):
-            outputs = llm.chat(messages, ...)
-        # During llm.chat, compute_retention_mask will use ag_mask directly.
+    1. Post-ViT AutoGaze (original):
+        with AutoGazeContext(ag_mask=mask, K=K):
+            outputs = llm.chat(...)
+        → compute_retention_mask uses ag_mask directly (which K patches to keep).
+        → compute_retained_tokens_count returns K (adaptive, not fixed formula).
+
+    2. Sparse ViT pass-through (Tasks 2+3):
+        with AutoGazeContext(K=K_merged):   # ag_mask=None
+            outputs = llm.chat(...)
+        → ViT already ran sparse (via SparseViTContext + patch_sparse_vit).
+        → compute_retained_tokens_count returns K_merged for correct slot allocation.
+        → compute_retention_mask returns identity (all-True, no post-ViT pruning).
     """
 
     def __init__(
@@ -43,19 +60,54 @@ class AutoGazeContext:
         ag_mask: torch.Tensor | None = None,
         K: int | None = None,
     ):
-        # ag_mask: (T*H*W,) bool tensor with True = keep this patch
-        self.payload = {"ag_mask": ag_mask, "K": K} if ag_mask is not None else None
+        if ag_mask is not None or K is not None:
+            self.payload = {"ag_mask": ag_mask, "K": K}
+        else:
+            self.payload = None
 
     def __enter__(self):
-        _ctx.raw_frames = self.payload
+        _ctx.payload = self.payload
         return self
 
     def __exit__(self, *args):
-        _ctx.raw_frames = None
+        _ctx.payload = None
 
 
-def get_raw_frames() -> torch.Tensor | None:
-    return getattr(_ctx, "raw_frames", None)
+def get_raw_frames() -> dict | None:
+    return getattr(_ctx, "payload", None)
+
+
+# ---------------------------------------------------------------------------
+# Task 1: Adaptive K — replace fixed compute_retained_tokens_count
+# ---------------------------------------------------------------------------
+
+def autogaze_retained_tokens_count(
+    tokens_per_frame: int,
+    T: int,
+    q: float,
+) -> int:
+    """
+    Adaptive K: return the token count from AutoGazeContext when available,
+    otherwise fall back to vLLM's fixed formula.
+
+    This is monkey-patched over vllm.multimodal.evs.compute_retained_tokens_count
+    by apply_autogaze_patch(). It ensures that the vLLM scheduler allocates the
+    right number of KV-cache slots for the actual AutoGaze selection, not the
+    rounded-down fixed-formula value.
+    """
+    stored = get_raw_frames()
+    if stored is not None and stored.get("K") is not None:
+        K = stored["K"]
+        print(
+            f"[AutoGaze-vLLM] Adaptive K={K} "
+            f"(from AutoGaze context, overrides fixed formula for T={T} frames)",
+            flush=True,
+        )
+        return K
+
+    if _vllm_retained_count is None:
+        raise RuntimeError("[AutoGaze-vLLM] vllm.multimodal.evs not available")
+    return _vllm_retained_count(tokens_per_frame, T, q)
 
 
 # ---------------------------------------------------------------------------
@@ -87,44 +139,33 @@ def magnitude_retention_mask(
     AutoGaze-inspired: rank patches by embedding magnitude (L2 norm).
     High-magnitude patches carry more information → keep the top-K.
 
-    This is a proof-of-concept that plugs into the same hook without
-    requiring the actual AutoGaze model weights or raw frames.
-
-    Differences from EVS (cosine similarity):
-      - EVS: measures temporal novelty (patch differs from previous frame)
-      - Magnitude: measures absolute saliency (patch has large activation)
-      - AutoGaze (production): learned importance from task signal
+    Uses vllm.multimodal.evs.compute_retained_tokens_count via module reference
+    so it respects the monkey-patch from apply_autogaze_patch() — meaning it
+    also benefits from adaptive K when AutoGazeContext is active.
     """
-    from vllm.multimodal.evs import compute_retained_tokens_count
+    import vllm.multimodal.evs as _evs_mod  # module ref, not local bind → patchable
 
     T, H, W = map(int, video_size_thw)
     rows, cols = H // spatial_merge_size, W // spatial_merge_size
     tokens_per_frame = rows * cols
 
-    retain_num = compute_retained_tokens_count(tokens_per_frame, T, q)
+    retain_num = _evs_mod.compute_retained_tokens_count(tokens_per_frame, T, q)
 
-    # Score = L2 norm of each patch embedding
     importance = video_embeds.norm(dim=-1)  # (T*rows*cols,)
 
-    # Always include first frame (same guarantee as EVS / AutoGaze)
-    first_frame_indices = torch.arange(tokens_per_frame, device=video_embeds.device)
-
-    # For remaining patches: rank by magnitude
+    # Force first frame in (same guarantee as EVS)
     rest_importance = importance.clone()
-    rest_importance[:tokens_per_frame] = float("inf")  # force first frame in
+    rest_importance[:tokens_per_frame] = float("inf")
     topk_indices = torch.topk(rest_importance, retain_num).indices
 
     mask = torch.zeros(video_embeds.shape[0], dtype=torch.bool, device=video_embeds.device)
     mask[topk_indices] = True
-    # Also ensure first frame is always fully retained
-    mask[:tokens_per_frame] = True
+    mask[:tokens_per_frame] = True  # always keep first frame
 
-    # Clip to exact retain_num (first frame already accounted for)
-    # Re-rank: importance of all selected
+    # Clip to exactly retain_num
     selected = mask.nonzero(as_tuple=True)[0]
     if selected.numel() > retain_num:
-        selected_importance = importance[selected]
-        keep = torch.topk(selected_importance, retain_num).indices
+        keep = torch.topk(importance[selected], retain_num).indices
         mask = torch.zeros_like(mask)
         mask[selected[keep]] = True
 
@@ -132,7 +173,7 @@ def magnitude_retention_mask(
 
 
 # ---------------------------------------------------------------------------
-# Full AutoGaze retention (uses nvidia/AutoGaze learned model + raw frames)
+# Full AutoGaze retention (Tasks 1+2+3)
 # ---------------------------------------------------------------------------
 
 _autogaze_model = None
@@ -143,21 +184,16 @@ def _load_autogaze():
     global _autogaze_model
     if _autogaze_model is not None:
         return _autogaze_model
-
     try:
-        # AutoGaze is loaded as part of the NVILA processor.
-        # Here we load the standalone selector.
         from transformers import AutoModel
         _autogaze_model = AutoModel.from_pretrained(
-            _autogaze_model_path,
-            trust_remote_code=True,
+            _autogaze_model_path, trust_remote_code=True,
         )
         _autogaze_model.eval()
         print(f"[AutoGaze-vLLM] Loaded AutoGaze model from {_autogaze_model_path}")
     except Exception as e:
         print(f"[AutoGaze-vLLM] Could not load AutoGaze model: {e}. Falling back to magnitude.")
         _autogaze_model = None
-
     return _autogaze_model
 
 
@@ -168,39 +204,54 @@ def autogaze_retention_mask(
     q: float,
 ) -> torch.Tensor:
     """
-    Full AutoGaze learned retention mask.
+    AutoGaze retention mask — handles three cases via AutoGazeContext:
 
-    If a pre-computed AutoGaze mask has been stored via AutoGazeContext,
-    uses it directly (the actual nvidia/AutoGaze model output).
+    Case A (sparse ViT pass-through, Tasks 2+3):
+        ag_mask is None, K is set.
+        The ViT already ran sparse (patch selection before encoding).
+        Return all-True of size video_embeds.shape[0] — identity, no post-ViT pruning.
 
-    Otherwise falls back to magnitude-based selection.
+    Case B (post-ViT AutoGaze, Task 1):
+        ag_mask is a (T*H*W,) bool tensor.
+        Use pre-computed AutoGaze mask directly.
+        If size doesn't match current video, fall back to magnitude.
 
-    For production use, pre-compute with AutoGazePreprocessor and store:
-        prep = AutoGazePreprocessor.load("nvidia/AutoGaze")
-        ag_mask, K = prep.compute_retention_mask(raw_frames, target_grid_hw=(rows, cols))
-        with AutoGazeContext(ag_mask, K):
-            outputs = llm.chat(...)
+    Case C (no context):
+        Fall back to magnitude-based selection.
     """
     stored = get_raw_frames()
 
-    # If we have a pre-computed AutoGaze mask stored in context, use it
-    if stored is not None and isinstance(stored, dict) and "ag_mask" in stored:
-        ag_mask = stored["ag_mask"]  # (T*H*W,) bool on CPU
-        T, H, W = map(int, video_size_thw)
-        rows, cols = H // spatial_merge_size, W // spatial_merge_size
-        expected_len = T * rows * cols
-        if ag_mask.numel() == expected_len:
+    if stored is not None:
+        ag_mask = stored.get("ag_mask")
+        K_stored = stored.get("K")
+
+        # ── Case A: sparse ViT pass-through ──────────────────────────────────
+        if ag_mask is None and K_stored is not None:
+            K_actual = video_embeds.shape[0]
             print(
-                f"[AutoGaze-vLLM] Using pre-computed AutoGaze mask: "
-                f"{ag_mask.sum().item()}/{expected_len} tokens kept",
+                f"[AutoGaze-vLLM] Sparse ViT pass-through: identity mask "
+                f"({K_actual} tokens, ViT already selected pre-encoding)",
                 flush=True,
             )
-            return ag_mask.to(video_embeds.device)
-        else:
+            return torch.ones(K_actual, dtype=torch.bool, device=video_embeds.device)
+
+        # ── Case B: pre-computed AutoGaze mask ────────────────────────────────
+        if ag_mask is not None:
+            T, H, W = map(int, video_size_thw)
+            rows, cols = H // spatial_merge_size, W // spatial_merge_size
+            expected_len = T * rows * cols
+            if ag_mask.numel() == expected_len:
+                print(
+                    f"[AutoGaze-vLLM] Using AutoGaze mask: "
+                    f"{ag_mask.sum().item()}/{expected_len} tokens kept",
+                    flush=True,
+                )
+                return ag_mask.to(video_embeds.device)
             print(
                 f"[AutoGaze-vLLM] Mask size mismatch: got {ag_mask.numel()}, "
                 f"expected {expected_len}. Falling back to magnitude.",
                 flush=True,
             )
 
+    # ── Case C: magnitude fallback ────────────────────────────────────────────
     return magnitude_retention_mask(video_embeds, video_size_thw, spatial_merge_size, q)

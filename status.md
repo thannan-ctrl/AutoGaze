@@ -1,7 +1,7 @@
 # AutoGaze × vLLM Experiment Status
 
 **Branch:** `vllm-integration-experiments`  
-**Last updated:** 2026-08-07 (~16:30 UTC)
+**Last updated:** 2026-08-10
 
 ---
 
@@ -50,9 +50,120 @@ All three select 376 tokens (fixed by `compute_retained_tokens_count(q=0.5)`). T
 
 ---
 
+## Architecture diagram
+
+### Current production path (Tasks 1–3 implemented)
+
+```
+ ┌─────────────────────────────────────────────────────────────────────────┐
+ │  OUTSIDE DOCKER  (auto_gaze conda env, transformers 4.x)               │
+ │                                                                         │
+ │   video.mp4                                                             │
+ │      │                                                                  │
+ │      ▼  load_frames (PyAV / torchcodec)                                 │
+ │   raw frames  (T, C, H, W)  float32 [0,1]                              │
+ │      │                                                                  │
+ │      ▼  AutoGazePreprocessor.compute_retention_mask()                   │
+ │   ┌──────────────────────────────────┐                                  │
+ │   │  nvidia/AutoGaze model           │                                  │
+ │   │  resize → 224×224, normalize     │                                  │
+ │   │  ShallowVideoConvNet + LLaMA-4L  │                                  │
+ │   │  → gazing_mask  (T, 14, 14)      │                                  │
+ │   │  → bilinear upsample             │                                  │
+ │   │      post-ViT:  → (T, 16, 16)   │  ──► ag_mask.pt   (Task 1+A5)   │
+ │   │      pre-ViT:   → (T, 32, 32)   │  ──► ag_mask_vit.pt (Task 2+3)  │
+ │   └──────────────────────────────────┘                                  │
+ └────────────────────────────────┬────────────────────────────────────────┘
+                                  │  file on disk  /tmp/ag_mask[_vit].pt
+ ┌────────────────────────────────▼────────────────────────────────────────┐
+ │  INSIDE DOCKER  (vLLM 0.26.0, PyTorch 2.11.0, GB200 arm64)            │
+ │                                                                         │
+ │  approach5_vllm_worker.py                                               │
+ │      │                                                                  │
+ │      ├─ apply_autogaze_patch(mode)          ◄── patch.py               │
+ │      │     patches compute_retention_mask                               │
+ │      │     patches compute_retained_tokens_count  (Task 1: adaptive K)  │
+ │      │                                                                  │
+ │      ├─ LLM(model, video_pruning_rate=0.5, enforce_eager=True)         │
+ │      │                                                                  │
+ │      ├─ patch_sparse_vit(llm)  [sparse_vit mode only]   ◄── sparse_vit.py
+ │      │     wraps visual encoder forward with gather op                  │
+ │      │                                                                  │
+ │      └─ llm.chat(messages)  inside context managers:                   │
+ │                                                                         │
+ │  ┌── SparseViTContext(mask_vit, K_vit, grid_thw)  [sparse_vit mode] ──┐│
+ │  │ ┌── AutoGazeContext(ag_mask, K)  [autogaze / sparse_vit mode] ────┐ ││
+ │  │ │                                                                  │ ││
+ │  │ │   video frames                                                   │ ││
+ │  │ │      │                                                           │ ││
+ │  │ │      ▼  Qwen3-VL visual encoder                                  │ ││
+ │  │ │   ┌──────────────────────────────────────────────────────────┐   │ ││
+ │  │ │   │  patch_embed   (T×32×32 patches → embeddings)  [all N]  │   │ ││
+ │  │ │   │       │                                                  │   │ ││
+ │  │ │   │       ▼  [GATHER selected_idx]  ◄── SparseViTContext     │   │ ││
+ │  │ │   │  K selected patch embeddings   (Task 2: pre-ViT select)  │   │ ││
+ │  │ │   │       │                                                  │   │ ││
+ │  │ │   │       ▼  transformer blocks  (O(K²) attn, O(K) FFN)      │   │ ││
+ │  │ │   │  K encoded patch embeddings   (Task 3: sparse ViT)       │   │ ││
+ │  │ │   │       │                                                  │   │ ││
+ │  │ │   │       ▼  spatial merger  (2×2 → 1)                       │   │ ││
+ │  │ │   │  K_merged visual tokens  (K_merged = K ÷ 4)              │   │ ││
+ │  │ │   └───────────────────┬──────────────────────────────────────┘   │ ││
+ │  │ │                       │                                          │ ││
+ │  │ │                       ▼  compute_retention_mask()                │ ││
+ │  │ │              ┌─────────────────────────────────────┐            │ ││
+ │  │ │              │  autogaze mode:  use ag_mask        │            │ ││
+ │  │ │              │  sparse_vit mode: identity (all-True)│  Task 1   │ ││
+ │  │ │              │  compute_retained_tokens_count → K  │◄──────────┘ ││
+ │  │ │              └──────────────┬──────────────────────┘             ││
+ │  │ └─────────────────────────────┼──────────────────────────────────┘ ││
+ │  └───────────────────────────────┼────────────────────────────────────┘│
+ │                                  │                                      │
+ │                                  ▼  K_merged tokens                    │
+ │                         Qwen3-VL-2B LLM decoder                        │
+ │                                  │                                      │
+ │                                  ▼                                      │
+ │                              answer text                                │
+ └─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Mode comparison
+
+```
+Mode          ViT input    ViT attn       Post-ViT        LLM tokens   Task
+─────────────────────────────────────────────────────────────────────────────
+dense         N patches    O(N²)          none            N/4          —
+evs           N patches    O(N²)          cosine sim→K    K/4          —
+magnitude     N patches    O(N²)          L2 norm→K       K/4          —
+autogaze      N patches    O(N²)          ag_mask→K       K/4          1
+sparse_vit    K patches    O(K²)≈N²/4    identity        K/4          1+2+3
+```
+
+### File map
+
+```
+autogaze/vllm_integration/
+  retention.py         AutoGazeContext · autogaze_retained_tokens_count (Task 1)
+                       autogaze_retention_mask · magnitude_retention_mask · evs
+  patch.py             apply_autogaze_patch() — patches both EVS hooks
+  sparse_vit.py        SparseViTContext · patch_sparse_vit() (Tasks 2+3)
+  autogaze_preprocess.py  AutoGazePreprocessor.compute_retention_mask()
+
+scripts/
+  run_autogaze_preprocess.py   outside Docker (auto_gaze env)
+                                 --grid-hw 16 16  → ag_mask.pt     (autogaze)
+                                 --grid-hw 32 32  → ag_mask_vit.pt (sparse_vit)
+  approach5_vllm_worker.py     inside Docker — modes: dense/evs/magnitude/autogaze/sparse_vit
+  approach5_vllm_integration.py  orchestrator: runs preprocess + Docker worker
+```
+
+---
+
 ## Remaining production path
 
-1. Replace `compute_retained_tokens_count` with AutoGaze's adaptive K (per-video budget)
-2. Move AutoGaze pre-ViT: select patches before ViT encoding → save ViT compute
-3. Sparse ViT encoding via gather op on selected patch indices
+1. ~~Replace `compute_retained_tokens_count` with AutoGaze's adaptive K~~ ✅ Task 1 done
+2. ~~Move AutoGaze pre-ViT: select patches before ViT encoding~~ ✅ Task 2 done
+3. ~~Sparse ViT encoding via gather op on selected patch indices~~ ✅ Task 3 done
 4. Upstream vLLM PR: add `token_count` field to `ModalityInput`
+5. Validate sparse_vit mode end-to-end in Docker (verify `_find_visual_encoder` path for Qwen3-VL)
+6. Run EgoSchema / Video-MME accuracy benchmark to confirm quality holds at K/N=0.5

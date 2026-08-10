@@ -5,11 +5,22 @@ using the auto_gaze conda env (transformers 4.x compatible).
 
 Saves the retention mask to a .pt file for the Docker worker to load.
 
-Usage:
+Usage — post-ViT AutoGaze mask (autogaze mode, default 16×16 post-merge grid):
     /path/to/auto_gaze/python run_autogaze_preprocess.py \
         --video /path/to/video.mp4 \
         --output /tmp/ag_mask.pt \
         --gazing-ratio 0.5
+
+Usage — pre-ViT sparse-ViT mask (sparse_vit mode, 32×32 ViT patch grid):
+    /path/to/auto_gaze/python run_autogaze_preprocess.py \
+        --video /path/to/video.mp4 \
+        --output /tmp/ag_mask_vit.pt \
+        --gazing-ratio 0.5 \
+        --grid-hw 32 32
+
+Grid sizes for Qwen3-VL at 448×448 input (14px patches, merge_size=2):
+    Post-merge (autogaze mode):  --grid-hw 16 16  [default]
+    Pre-merge  (sparse_vit mode): --grid-hw 32 32
 """
 import argparse
 import os
@@ -75,24 +86,38 @@ def main():
     parser.add_argument("--video", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--gazing-ratio", type=float, default=0.5)
-    parser.add_argument("--target-grid-h", type=int, default=16)
-    parser.add_argument("--target-grid-w", type=int, default=16)
+    parser.add_argument("--target-grid-h", type=int, default=None,
+                        help="Grid height (deprecated: use --grid-hw instead)")
+    parser.add_argument("--target-grid-w", type=int, default=None,
+                        help="Grid width (deprecated: use --grid-hw instead)")
+    parser.add_argument("--grid-hw", type=int, nargs=2, default=None,
+                        metavar=("H", "W"),
+                        help="Grid size H W (e.g. 16 16 for post-merge, 32 32 for pre-merge/sparse-ViT)")
     parser.add_argument("--autogaze-model", default="nvidia/AutoGaze")
     args = parser.parse_args()
 
+    # Resolve grid size: --grid-hw takes priority, then --target-grid-h/w, then default 16×16
+    if args.grid_hw is not None:
+        grid_h, grid_w = args.grid_hw
+    elif args.target_grid_h is not None or args.target_grid_w is not None:
+        grid_h = args.target_grid_h or 16
+        grid_w = args.target_grid_w or 16
+    else:
+        grid_h, grid_w = 16, 16
+
     print(f"[autogaze_preprocess] Video: {args.video}", flush=True)
     print(f"[autogaze_preprocess] gazing_ratio: {args.gazing_ratio}", flush=True)
-    print(f"[autogaze_preprocess] target_grid: ({args.target_grid_h}, {args.target_grid_w})", flush=True)
+    print(f"[autogaze_preprocess] target_grid: ({grid_h}, {grid_w})", flush=True)
 
     from autogaze.vllm_integration.autogaze_preprocess import AutoGazePreprocessor
 
-    raw_frames = load_frames_ffmpeg(args.video)  # noqa: name kept for compat
+    raw_frames = load_frames_ffmpeg(args.video)
     print(f"[autogaze_preprocess] Loaded {raw_frames.shape[0]} frames", flush=True)
 
     prep = AutoGazePreprocessor.load(args.autogaze_model)
     mask, K = prep.compute_retention_mask(
         raw_frames,
-        target_grid_hw=(args.target_grid_h, args.target_grid_w),
+        target_grid_hw=(grid_h, grid_w),
         gazing_ratio=args.gazing_ratio,
     )
 
