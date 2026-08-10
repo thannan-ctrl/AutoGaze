@@ -60,7 +60,8 @@ def precompute_mask(grid_h: int, grid_w: int, output: str, pruning_rate: float) 
     return elapsed_ms
 
 
-def run_docker(mode: str, pruning_rate: float, reps: int, mask_path: str) -> dict:
+def run_docker(mode: str, pruning_rate: float, reps: int, mask_path: str,
+               single_env: bool = False, gazing_ratio: float = 0.245) -> dict:
     """
     Run one mode in a Docker container.
     Returns the parsed RESULT_JSON dict augmented with wall_ms.
@@ -74,16 +75,23 @@ def run_docker(mode: str, pruning_rate: float, reps: int, mask_path: str) -> dic
         "-v", f"{HF_CACHE}:/root/.cache/huggingface",
         "-v", f"{REPO_DIR}:/workspace/AutoGaze",
     ]
-    # Mount whichever mask file is needed
-    if mode in ("autogaze", "sparse_vit") and os.path.exists(mask_path):
-        vol_mounts += ["-v", f"{mask_path}:{mask_path}"]
-        env_vars  += ["-e", f"AUTOGAZE_MASK_PATH={mask_path}"]
 
     worker_args = [
         "--mode", mode,
         "--pruning-rate", str(pruning_rate),
         "--reps", str(reps),
     ]
+
+    if single_env and mode == "sparse_vit":
+        # Pass video path — worker runs AutoGaze preprocessing inline
+        worker_args += [
+            "--video", f"/workspace/AutoGaze/assets/example_input.mp4",
+            "--gazing-ratio", str(gazing_ratio),
+        ]
+    elif mode in ("autogaze", "sparse_vit") and mask_path and os.path.exists(mask_path):
+        # Mount whichever mask file is needed (two-env flow)
+        vol_mounts += ["-v", f"{mask_path}:{mask_path}"]
+        env_vars  += ["-e", f"AUTOGAZE_MASK_PATH={mask_path}"]
 
     cmd = [
         "docker", "run", "--rm",
@@ -231,32 +239,37 @@ def main():
     parser.add_argument("--reps", type=int, default=3,
                         help="Inference reps per mode (first=warmup)")
     parser.add_argument("--pruning-rate", type=float, default=0.5)
+    parser.add_argument("--gazing-ratio", type=float, default=0.245)
     parser.add_argument("--modes", nargs="+",
                         default=["dense", "evs", "sparse_vit"],
                         choices=["dense", "evs", "magnitude", "autogaze", "sparse_vit"],
                         help="Modes to benchmark")
+    parser.add_argument("--single-env", action="store_true",
+                        help="Run AutoGaze preprocessing inside Docker (no auto_gaze env needed)")
     args = parser.parse_args()
 
     pruning_rate = args.pruning_rate
     reps = args.reps
     modes = args.modes
+    single_env = args.single_env
 
     print("=" * 70)
     print("Runtime Analysis — dense vs EVS vs sparse_vit")
     print("=" * 70)
-    print(f"Modes: {modes}  |  pruning_rate={pruning_rate}  |  reps={reps}")
+    print(f"Modes: {modes}  |  pruning_rate={pruning_rate}  |  reps={reps}  |  single_env={single_env}")
     print(f"Image: {VLLM_IMAGE}\n")
 
-    # ── Precompute masks that are needed ──────────────────────────────────────
+    # ── Precompute masks (two-env flow only) ──────────────────────────────────
     preprocess_times = {}
 
-    if "autogaze" in modes:
-        t = precompute_mask(16, 16, MASK_PATH_POST, pruning_rate)
-        preprocess_times["autogaze"] = t
+    if not single_env:
+        if "autogaze" in modes:
+            t = precompute_mask(16, 16, MASK_PATH_POST, pruning_rate)
+            preprocess_times["autogaze"] = t
 
-    if "sparse_vit" in modes:
-        t = precompute_mask(32, 32, MASK_PATH_VIT, pruning_rate)
-        preprocess_times["sparse_vit"] = t
+        if "sparse_vit" in modes:
+            t = precompute_mask(32, 32, MASK_PATH_VIT, args.gazing_ratio)
+            preprocess_times["sparse_vit"] = t
 
     # ── Run each mode in Docker ───────────────────────────────────────────────
     results = []
@@ -277,6 +290,8 @@ def main():
                 pruning_rate=pruning_rate,
                 reps=reps,
                 mask_path=mask_map.get(mode) or "",
+                single_env=single_env,
+                gazing_ratio=args.gazing_ratio,
             )
             r["preprocess_ms"] = preprocess_times.get(mode)
             results.append(r)

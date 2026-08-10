@@ -14,7 +14,6 @@
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
-from omegaconf import OmegaConf
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
 

@@ -1,28 +1,26 @@
 #!/usr/bin/env python3
 """
-Approach 5 — AutoGaze × vLLM integration worker.
-Runs INSIDE the vLLM Docker container with CLI args: --mode --pruning-rate --reps
+AutoGaze × vLLM worker — runs INSIDE the Docker container.
 
 Modes:
   dense       — no compression, all visual tokens
   evs         — built-in vLLM EVS (cosine similarity)
-  magnitude   — magnitude-based proxy (no extra model); adaptive K (Task 1)
-  autogaze    — post-ViT AutoGaze mask + adaptive K (Task 1)
-  sparse_vit  — pre-ViT gather op + sparse ViT blocks + adaptive K (Tasks 1+2+3)
+  sparse_vit  — pre-ViT gather op + sparse ViT blocks + adaptive K
 
-Timing outputs (in RESULT_JSON):
-  load_ms     — model load time
-  elapsed_ms  — first rep total inference time  (vit + lm)
-  vit_ms      — ViT encoder time  (CUDA events, from timing hook)
-  lm_ms       — elapsed_ms - vit_ms
-  reps        — list of per-rep {elapsed_ms, vit_ms, num_prompt_tokens, answer}
+When --video is provided without --mask, AutoGaze preprocessing runs
+inline (single environment — no external auto_gaze env needed).
 
 Usage:
-    python approach5_vllm_worker.py --mode sparse_vit --pruning-rate 0.5 --reps 3
+    # With pre-computed mask (legacy two-env flow):
+    python worker.py --mode sparse_vit --mask /tmp/ag_mask_vit.pt --reps 3
+
+    # Fully self-contained single-env flow:
+    python worker.py --mode sparse_vit --video /path/to/video.mp4 --gazing-ratio 0.245 --reps 3
 """
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -31,6 +29,24 @@ HF_HOME = os.environ.get("HF_HOME", "/root/.cache/huggingface")
 sys.path.insert(0, REPO_DIR)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ["HF_HOME"] = HF_HOME
+
+# Docker container ships ffmpeg at a non-standard path; add it to PATH.
+_DOCKER_FFMPEG = "/opt/ffmpeg-safe/bin"
+if os.path.isdir(_DOCKER_FFMPEG) and _DOCKER_FFMPEG not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = _DOCKER_FFMPEG + ":" + os.environ.get("PATH", "")
+
+# AutoGaze extra deps not shipped in the vLLM image — install on first run.
+def _ensure_deps():
+    missing = []
+    for pkg, imp in [("timm", "timm"), ("omegaconf", "omegaconf"),
+                     ("wandb", "wandb"), ("loguru", "loguru"), ("av", "av")]:
+        try:
+            __import__(imp)
+        except ImportError:
+            missing.append(pkg)
+    if missing:
+        print(f"[worker] Installing missing deps: {missing}", flush=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q"] + missing, check=True)
 
 MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
 VIDEO_PATH = os.path.join(REPO_DIR, "assets", "example_input.mp4")
@@ -87,6 +103,13 @@ def main():
     parser.add_argument("--pruning-rate", type=float, default=0.5)
     parser.add_argument("--reps", type=int, default=1,
                         help="Number of inference repetitions (first is warmup, rest are measured)")
+    # Single-env flow: run AutoGaze preprocessing inline
+    parser.add_argument("--video", default=None,
+                        help="Video path — triggers inline AutoGaze preprocessing (no external env needed)")
+    parser.add_argument("--gazing-ratio", type=float, default=0.245,
+                        help="AutoGaze gazing ratio when running inline preprocessing")
+    parser.add_argument("--mask", default=None,
+                        help="Pre-computed mask .pt file (legacy two-env flow)")
     args = parser.parse_args()
 
     mode = args.mode
@@ -118,18 +141,34 @@ def main():
         apply_autogaze_patch(mode="autogaze")
 
     elif mode == "sparse_vit":
-        mask_path = os.environ.get("AUTOGAZE_MASK_PATH", "/tmp/ag_mask_vit.pt")
-        if not os.path.exists(mask_path):
-            raise FileNotFoundError(
-                f"AutoGaze ViT-level mask not found at {mask_path}. "
-                "Run run_autogaze_preprocess.py --grid-hw 32 32 first."
-            )
         import torch as _torch
-        payload = _torch.load(mask_path, weights_only=True)
-        mask_vit = payload["mask"]
-        K_vit = int(payload["K"])
+        # Determine mask source: inline preprocessing or pre-computed file
+        mask_path = args.mask or os.environ.get("AUTOGAZE_MASK_PATH", "/tmp/ag_mask_vit.pt")
+
+        if args.video:
+            # ── Single-env flow: run AutoGaze preprocessing inline ────────────
+            _ensure_deps()
+            print(f"[worker] Running AutoGaze inline on {args.video} ...", flush=True)
+            from autogaze.vllm_integration.autogaze_preprocess import AutoGazePreprocessor
+            _prep = AutoGazePreprocessor.load("nvidia/AutoGaze")
+            _raw = load_video_frames(args.video)
+            mask_vit, K_vit = _prep.compute_retention_mask(
+                _raw, target_grid_hw=QWEN_VIT_GRID_HW,
+                gazing_ratio=args.gazing_ratio, seed=42,
+            )
+        elif os.path.exists(mask_path):
+            # ── Legacy flow: load pre-computed mask file ──────────────────────
+            payload = _torch.load(mask_path, weights_only=True)
+            mask_vit = payload["mask"]
+            K_vit = int(payload["K"])
+        else:
+            raise FileNotFoundError(
+                f"No mask at {mask_path} and no --video provided. "
+                "Pass --video for inline preprocessing or --mask for a pre-computed file."
+            )
+
         K_merged = K_vit // QWEN_MERGE_FACTOR
-        print(f"[approach5] Loaded AutoGaze ViT-level mask: K_vit={K_vit}, K_merged≈{K_merged}", flush=True)
+        print(f"[worker] sparse_vit mask: K_vit={K_vit}, K_merged≈{K_merged}", flush=True)
         from autogaze.vllm_integration.patch import apply_autogaze_patch
         apply_autogaze_patch(mode="autogaze")
 

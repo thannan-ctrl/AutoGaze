@@ -17,8 +17,6 @@ from torch import nn
 from torch.nn import functional as F
 from contextlib import nullcontext
 from einops import rearrange
-from omegaconf import OmegaConf
-
 from transformers.modeling_utils import PreTrainedModel
 from autogaze.utils import get_gazing_pos_from_gazing_mask
 from .modeling_autogaze import AutoGazeModel

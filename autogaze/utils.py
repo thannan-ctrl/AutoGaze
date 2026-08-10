@@ -11,13 +11,10 @@
 
 import builtins
 
-from omegaconf import OmegaConf
-from loguru import logger
 import sys
 import os
 import torch
 import numpy as np
-import wandb
 import random
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -78,6 +75,7 @@ class AverageScalarMeter(object):
 
 
 def plot_grad_norms(named_parameters, name_prefix=''):
+    import wandb
     for name, param in named_parameters:
         if param.grad is not None:
             norm = torch.linalg.vector_norm(param.grad, 2.0).item()
@@ -93,6 +91,7 @@ def suppress_print():
 
 def suppress_wandb():
     """Suppresses wandb logging from the current_process."""
+    import wandb
     # Store original functions
     original_functions = {}
     for attr_name in dir(wandb):
@@ -111,11 +110,13 @@ def suppress_wandb():
 
 def suppress_logging():
     """Suppresses loguru logging from the current process."""
+    from loguru import logger
     logger.remove()  # Remove all handlers
     logger.add(lambda _: None)  # Add a no-op handler
 
 
 def dump_cfg(cfg, logdir):
+    from omegaconf import OmegaConf
     out_f = os.path.join(logdir, "config.yaml")
     with open(out_f, "w") as f:
         f.write(OmegaConf.to_yaml(cfg))
