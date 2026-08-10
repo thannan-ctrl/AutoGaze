@@ -132,6 +132,10 @@ def main():
         print(f"[approach5] Loaded AutoGaze ViT-level mask: K_vit={K_vit}, K_merged≈{K_merged}", flush=True)
         from autogaze.vllm_integration.patch import apply_autogaze_patch
         apply_autogaze_patch(mode="autogaze")
+        # Class-level sparse ViT patch — must run BEFORE LLM() so the patch is
+        # inherited by the EngineCore subprocess (vLLM ≥0.24 V1 engine).
+        from autogaze.vllm_integration.sparse_vit import patch_sparse_vit as _patch_cls
+        _patch_cls(llm=None)
 
     elif mode == "magnitude":
         from autogaze.vllm_integration.patch import apply_autogaze_patch
@@ -159,12 +163,12 @@ def main():
     load_ms = (time.perf_counter() - t_load) * 1000
     print(f"[approach5] Model loaded in {load_ms:.0f} ms", flush=True)
 
-    # ── Tasks 2+3: patch visual encoder for sparse ViT ────────────────────────
+    # ── Tasks 2+3: instance-level patch attempt (works if executor is in-process) ─
     if mode == "sparse_vit":
         from autogaze.vllm_integration.sparse_vit import patch_sparse_vit
-        encoder = patch_sparse_vit(llm)
+        encoder = patch_sparse_vit(llm)   # no-op if class patch already applied above
         if encoder is None:
-            print("[approach5] WARNING: visual encoder not found — sparse_vit falls back to post-ViT.", flush=True)
+            print("[approach5] WARNING: visual encoder patch unavailable — sparse_vit runs class-patched or falls back to post-ViT.", flush=True)
 
     # ── CUDA event timing hook on ViT (all non-dense modes) ──────────────────
     from autogaze.vllm_integration.sparse_vit import patch_vit_timing, get_vit_ms

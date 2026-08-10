@@ -165,10 +165,15 @@ def _find_visual_encoder(llm) -> Optional[object]:
     """
     Locate the visual encoder (ViT) inside a vLLM LLM object.
 
-    Tries several attribute paths used across vLLM 0.24–0.27 for Qwen2.5/3-VL.
-    Prints top-level model attributes if the encoder is not found so the caller
-    can adapt the path manually.
+    Tries instance-level paths (vLLM ≤0.23 / single-process executor) and
+    class-level paths (vLLM ≥0.24 V1 engine where the model runs in the
+    EngineCore subprocess and is not reachable from the main process).
+
+    For V1 (class-level), we patch the class's forward method directly so the
+    patch is already in place when vLLM instantiates the model in EngineCore.
+    Call patch_sparse_vit() BEFORE LLM(...) to take advantage of this.
     """
+    # ── Instance-level discovery (vLLM ≤0.23, single-process executor) ────────
     raw_model = None
     try:
         driver = llm.llm_engine.model_executor.driver_worker
@@ -178,33 +183,50 @@ def _find_visual_encoder(llm) -> Optional[object]:
         if runner is not None:
             raw_model = runner.model
     except Exception as e:
-        print(f"[SparseViT] Could not reach model executor: {e}", flush=True)
+        print(f"[SparseViT] Instance path unavailable ({e}), trying class-level.", flush=True)
 
-    if raw_model is None:
-        return None
+    if raw_model is not None:
+        for path in [
+            "model.visual",
+            "visual",
+            "model.vision_model",
+            "vision_model",
+            "model.model.visual",
+        ]:
+            obj = raw_model
+            for attr in path.split("."):
+                obj = getattr(obj, attr, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                print(f"[SparseViT] Found visual encoder at '{path}': {type(obj).__name__}", flush=True)
+                return obj
+        top = [a for a in dir(raw_model) if not a.startswith("_")][:30]
+        print(f"[SparseViT] Instance found but visual encoder not at known paths. Attrs: {top}", flush=True)
 
-    for path in [
-        "model.visual",
-        "visual",
-        "model.vision_model",
-        "vision_model",
-        "model.model.visual",
+    # ── Class-level discovery (vLLM ≥0.24 V1, model in EngineCore subprocess) ─
+    # Patch the class before the model is loaded so the patch is inherited by
+    # the EngineCore process.  Caller must invoke patch_sparse_vit() BEFORE LLM().
+    for cls_path in [
+        ("vllm.model_executor.models.qwen3_vl",   "Qwen2_5VLVisionTransformer"),
+        ("vllm.model_executor.models.qwen2_5_vl", "Qwen2_5VLVisionTransformer"),
+        ("vllm.model_executor.models.qwen2_vl",   "Qwen2VLVisionTransformer"),
     ]:
-        obj = raw_model
-        for attr in path.split("."):
-            obj = getattr(obj, attr, None)
-            if obj is None:
-                break
-        if obj is not None:
-            print(f"[SparseViT] Found visual encoder at '{path}': {type(obj).__name__}", flush=True)
-            return obj
+        try:
+            import importlib
+            mod = importlib.import_module(cls_path[0])
+            cls = getattr(mod, cls_path[1], None)
+            if cls is not None:
+                print(
+                    f"[SparseViT] Class-level encoder: {cls_path[0]}.{cls_path[1]}  "
+                    f"(patch applied to class, active in EngineCore subprocess)",
+                    flush=True,
+                )
+                return cls  # caller will patch cls.forward as an unbound method
+        except ImportError:
+            continue
 
-    top = [a for a in dir(raw_model) if not a.startswith("_")][:30]
-    print(
-        f"[SparseViT] Visual encoder not found. "
-        f"Top-level model attrs: {top}",
-        flush=True,
-    )
+    print("[SparseViT] Visual encoder class not found in known vLLM module paths.", flush=True)
     return None
 
 
@@ -371,16 +393,24 @@ def _sparse_vit_forward(
 # Patch / restore
 # ---------------------------------------------------------------------------
 
-def patch_sparse_vit(llm) -> Optional[object]:
+def patch_sparse_vit(llm=None) -> Optional[object]:
     """
     Patch the vLLM visual encoder for sparse ViT encoding (Tasks 2+3).
 
-    Must be called AFTER ``llm = LLM(...)`` is created.
+    Two modes depending on vLLM version:
+
+    Instance mode (vLLM ≤0.23, single-process executor):
+        Call AFTER ``llm = LLM(...)`` — patches the specific encoder instance.
+
+    Class mode (vLLM ≥0.24 V1 engine, model in EngineCore subprocess):
+        Call BEFORE ``llm = LLM(...)`` — patches the encoder class so the
+        patch is inherited when EngineCore instantiates the model.
+        Pass llm=None: ``patch_sparse_vit()``
 
     The patch is a no-op when no SparseViTContext is active, so the same
     LLM instance can be used for both dense and sparse inference.
 
-    Returns the patched encoder module, or None if the encoder was not found.
+    Returns the patched encoder object (instance or class), or None on failure.
     """
     encoder = _find_visual_encoder(llm)
     if encoder is None:
@@ -392,21 +422,45 @@ def patch_sparse_vit(llm) -> Optional[object]:
         print("[SparseViT] Visual encoder already patched.", flush=True)
         return encoder
 
-    original_forward = encoder.forward
-    _PATCHED_ENCODERS[enc_id] = original_forward
+    import inspect
+    is_class = inspect.isclass(encoder)
 
-    def _patched_forward(*args, **kwargs):
-        payload = get_sparse_payload()
-        if payload is None:
-            return original_forward(*args, **kwargs)
-        return _sparse_vit_forward(encoder, original_forward, payload, *args, **kwargs)
+    if is_class:
+        # Class-level patch: wrap the unbound forward method
+        original_forward = encoder.forward
 
-    encoder.forward = _patched_forward
-    print(
-        f"[SparseViT] Patched {type(encoder).__name__}.forward "
-        "(sparse when SparseViTContext active, dense otherwise).",
-        flush=True,
-    )
+        def _patched_class_forward(self, *args, **kwargs):
+            payload = get_sparse_payload()
+            if payload is None:
+                return original_forward(self, *args, **kwargs)
+            bound_orig = original_forward.__get__(self, type(self))
+            return _sparse_vit_forward(self, bound_orig, payload, *args, **kwargs)
+
+        encoder.forward = _patched_class_forward
+        _PATCHED_ENCODERS[enc_id] = original_forward
+        print(
+            f"[SparseViT] Class-level patch applied to {encoder.__name__}.forward "
+            "(active in EngineCore subprocess when SparseViTContext is set).",
+            flush=True,
+        )
+    else:
+        # Instance-level patch
+        original_forward = encoder.forward
+        _PATCHED_ENCODERS[enc_id] = original_forward
+
+        def _patched_instance_forward(*args, **kwargs):
+            payload = get_sparse_payload()
+            if payload is None:
+                return original_forward(*args, **kwargs)
+            return _sparse_vit_forward(encoder, original_forward, payload, *args, **kwargs)
+
+        encoder.forward = _patched_instance_forward
+        print(
+            f"[SparseViT] Instance patch applied to {type(encoder).__name__}.forward "
+            "(sparse when SparseViTContext active, dense otherwise).",
+            flush=True,
+        )
+
     return encoder
 
 

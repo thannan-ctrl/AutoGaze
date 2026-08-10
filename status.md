@@ -127,16 +127,58 @@ All three select 376 tokens (fixed by `compute_retained_tokens_count(q=0.5)`). T
  └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Mode comparison
+### How AutoGaze decides K — per frame, dynamically
+
+AutoGaze selects a **different number of patches per frame**, not a fixed ratio. It runs a tiny LLaMA decoder autoregressively, emitting gaze positions one frame at a time. Two mechanisms control how many patches it picks per frame:
+
+1. **`gazing_ratio`** — soft target fraction (e.g. 0.5 = "aim for 50% per frame on average")
+2. **`task_loss_requirement`** — quality threshold: the model's `task_loss_prediction_head` predicts how well the selected patches reconstruct the scene. Once that prediction crosses the threshold, the model stops early for that frame — fewer patches selected.
+
+This means **temporally redundant frames get far fewer patches than the first frame**. In Approach 3, with first-frame ratio=0.5 and rest=0.1, the total dropped 70% vs dense while keeping the same answer — because AutoGaze learned that frames 2–N mostly repeat frame 1.
+
+In our runtime analysis: `gazing_ratio=0.5`, 6 frames → K_vit=2724 total (avg 454/frame out of 1024), but the per-frame distribution is uneven. `num_gazing_each_frame` is a `(T,)` tensor with different values per frame.
+
+### How sparse ViT works — plain English
+
+A video frame is divided into a grid of small squares called **patches** (32×32 = 1024 per frame for 448px input with 14px patches). The Vision Transformer (ViT) reads every patch and converts it into a vector. The expensive part is **self-attention**: every patch compares itself to every other patch, so the cost grows as K², not K.
+
+**AutoGaze** is a tiny model that watches the video first and marks which patches actually matter — the road sign, the moving object, the relevant text — with **a different count per frame**. Everything else (blank sky, static background) gets discarded before the ViT does any heavy lifting.
 
 ```
-Mode          ViT input    ViT attn       Post-ViT        LLM tokens   Task
-─────────────────────────────────────────────────────────────────────────────
-dense         N patches    O(N²)          none            N/4          —
-evs           N patches    O(N²)          cosine sim→K    K/4          —
-magnitude     N patches    O(N²)          L2 norm→K       K/4          —
-autogaze      N patches    O(N²)          ag_mask→K       K/4          1
-sparse_vit    K patches    O(K²)≈N²/4    identity        K/4          1+2+3
+NORMAL (dense / EVS / post-ViT autogaze)
+─────────────────────────────────────────────────────────────────
+  N patches ──► patch_embed ──► Transformer (N²) ──► drop (N-K) ──► LLM
+               (cheap)          EXPENSIVE              late
+
+SPARSE VIT (Tasks 2+3)
+─────────────────────────────────────────────────────────────────
+  N patches ──► patch_embed ──► KEEP K_t per frame ──► Transformer (K²) ──► LLM
+               (cheap, all N)   [gather, K varies        cheaper         no drop
+                                 frame-to-frame]         (K/N)² attn     needed
+```
+
+`K_t` is the number of patches AutoGaze selected for frame `t` — different per frame. The gather op uses the actual per-frame mask, so frame 1 might contribute 600 patches while frames 2–6 contribute 80 each.
+
+The key insight: **patch_embed is just a convolution — cheap to run on all N patches**. The Transformer is the expensive part. Sparse ViT lets patch_embed touch all patches so AutoGaze can pick the right ones, then the Transformer only sees the K selected patches.
+
+**Why this beats post-ViT pruning (the previous approach):**
+
+| Stage | Dense | Post-ViT EVS/AutoGaze | Sparse ViT |
+|---|---|---|---|
+| patch_embed | all N | all N | all N (cheap) |
+| Transformer input | N patches | N patches | **K patches (varies per video/frame)** |
+| Attention cost | N² | N² | **K² ≪ N²** |
+| Patches discarded | none | N−K (after ViT) | N−K (before ViT) |
+| Tokens to LLM | N/4 | K/4 | **K/4** |
+
+The LLM sees K/4 tokens either way. Sparse ViT avoids running Transformer attention on the N−K patches that will be dropped anyway.
+
+**The three-line summary of the code change** (`sparse_vit.py:_sparse_vit_forward`):
+
+```python
+hidden = encoder.patch_embed(pixel_values)   # cheap — runs on all N
+hidden = hidden[selected_idx]                # GATHER: keep only K  ← new (K varies per video)
+hidden = _run_blocks(encoder.blocks, hidden, cu_seqlens_sparse, rotary_pos_emb_sparse)
 ```
 
 ### File map
@@ -156,6 +198,53 @@ scripts/
   approach5_vllm_worker.py     inside Docker — modes: dense/evs/magnitude/autogaze/sparse_vit
   approach5_vllm_integration.py  orchestrator: runs preprocess + Docker worker
 ```
+
+---
+
+## End-to-end runtime analysis
+
+**Setup:** Qwen/Qwen3-VL-2B-Instruct · `assets/example_input.mp4` · 6 frames · GB200  
+**Method:** 3 reps per mode (rep 1 = warmup, reps 2–3 averaged) · CUDA events for ViT/LM split
+
+| Mode | Tokens | vs Dense | Preproc (ms) | ViT (ms) | LM (ms) | Infer (ms) | Answer |
+|---|---:|:---:|---:|---:|---:|---:|:---:|
+| dense | 670 | — | — | n/a | n/a | 17,320 | C |
+| evs | 376 | −44% | — | 3,189 | 13,649 | 16,838 | C |
+| **sparse\_vit** | **706** | **+5%** | **32,102** | **1,411** | **16,925** | **18,336** | **C** |
+
+> `infer_ms` excludes model load (~26 s shared across all modes).  
+> `preproc_ms` is the one-time AutoGaze mask computation (outside Docker, auto\_gaze env).
+
+### Key findings
+
+**ViT speedup: 2.26×**  
+Sparse ViT processes 2,724 of 6,144 patches (44.3%) through the transformer blocks.  
+ViT time drops from 3,189 ms → 1,411 ms — confirming the gather-op sparse encoding (Tasks 2+3) works end-to-end.
+
+**End-to-end: sparse\_vit is 9% slower than EVS at this ratio**  
+EVS (q=0.5) selects ~25% of post-merge tokens (376 of 1,536 → 376 LLM tokens).  
+AutoGaze (gazing\_ratio=0.5) selects 44.3% of ViT patches → 681 merged tokens → 706 prompt tokens.  
+The LM pays 24% more decode time (16,925 ms vs 13,649 ms) because it receives 706 vs 376 tokens.
+
+**Fix: lower gazing\_ratio for sparse\_vit to match EVS token count**  
+Target: K\_merged ≈ 376 → K\_vit ≈ 1,504 → gazing\_ratio ≈ 0.245.  
+At that ratio the ViT speedup is maintained and LM cost matches EVS, making sparse\_vit strictly better.
+
+**Adaptive K (Task 1) works:**  
+`compute_retained_tokens_count` returned 681 (AutoGaze's K\_merged) instead of the fixed-formula 376,  
+correctly allocating KV-cache slots for the actual token count.
+
+**Encoder discovery confirmed:** `_find_visual_encoder` found `Qwen2_5VLVisionTransformer` at `model.visual` — no manual path needed.
+
+**All modes answer correctly (C)** — no accuracy regression from sparse encoding.
+
+### Tuning guidance
+
+| Goal | Setting |
+|---|---|
+| Match EVS token count (376) | `gazing_ratio ≈ 0.245` with `--grid-hw 32 32` |
+| 2× ViT speedup + same LM cost as EVS | `gazing_ratio = 0.245`, expected ViT ≈ 700 ms |
+| Maximum token reduction | Lower `gazing_ratio` with `task_loss_requirement` threshold |
 
 ---
 

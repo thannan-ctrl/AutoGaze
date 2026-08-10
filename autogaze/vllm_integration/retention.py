@@ -83,8 +83,11 @@ def get_raw_frames() -> dict | None:
 
 def autogaze_retained_tokens_count(
     tokens_per_frame: int,
-    T: int,
-    q: float,
+    T: int = 0,
+    q: float = 0.0,
+    *,
+    num_frames: int | None = None,  # vLLM ≥0.24 passes this kwarg instead of positional T
+    **_kwargs,                       # absorb any other future kwargs gracefully
 ) -> int:
     """
     Adaptive K: return the token count from AutoGazeContext when available,
@@ -94,7 +97,13 @@ def autogaze_retained_tokens_count(
     by apply_autogaze_patch(). It ensures that the vLLM scheduler allocates the
     right number of KV-cache slots for the actual AutoGaze selection, not the
     rounded-down fixed-formula value.
+
+    vLLM 0.24+ calls with num_frames=N as a keyword argument; earlier versions
+    pass T as the second positional argument. Both are handled here.
     """
+    if num_frames is not None:
+        T = num_frames
+
     stored = get_raw_frames()
     if stored is not None and stored.get("K") is not None:
         K = stored["K"]
@@ -107,7 +116,11 @@ def autogaze_retained_tokens_count(
 
     if _vllm_retained_count is None:
         raise RuntimeError("[AutoGaze-vLLM] vllm.multimodal.evs not available")
-    return _vllm_retained_count(tokens_per_frame, T, q)
+    # Forward with the right calling convention for the installed vLLM version
+    try:
+        return _vllm_retained_count(tokens_per_frame, T, q)
+    except TypeError:
+        return _vllm_retained_count(tokens_per_frame, num_frames=T, q=q)
 
 
 # ---------------------------------------------------------------------------

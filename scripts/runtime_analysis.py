@@ -29,7 +29,7 @@ REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HF_CACHE = os.environ.get("HF_HOME", "/home/scratch.thannan_wwfo/hf_cache")
 RESULTS_FILE = os.path.join(REPO_DIR, "runtime_analysis.json")
 
-VLLM_IMAGE = "gitlab-master.nvidia.com:5005/dl/dgx/vllm:main-py3.60784172-devel-arm64"
+VLLM_IMAGE = "nvcr.io/nvidia/vllm:26.07-py3"
 AUTOGAZE_PYTHON = "/home/scratch.thannan_wwfo/miniforge-aarch64/envs/auto_gaze/bin/python"
 
 MASK_PATH_POST  = "/tmp/ag_mask_runtime.pt"       # 16×16 post-merge  (autogaze reference)
