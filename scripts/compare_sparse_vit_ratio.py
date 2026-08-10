@@ -56,7 +56,7 @@ def run_sparse_vit(mask_path: str, gazing_ratio: float, reps: int) -> dict:
         "--gpus", "all", "--shm-size", "16g",
         *vol_mounts, *env_vars,
         VLLM_IMAGE,
-        "python", "/workspace/AutoGaze/scripts/approach5_vllm_worker.py",
+        "python", "/workspace/AutoGaze/scripts/worker.py",
         "--mode", "sparse_vit",
         "--pruning-rate", str(gazing_ratio),
         "--reps", str(reps),

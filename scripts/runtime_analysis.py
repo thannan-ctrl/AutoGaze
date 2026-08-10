@@ -92,7 +92,7 @@ def run_docker(mode: str, pruning_rate: float, reps: int, mask_path: str) -> dic
         *vol_mounts,
         *env_vars,
         VLLM_IMAGE,
-        "python", "/workspace/AutoGaze/scripts/approach5_vllm_worker.py",
+        "python", "/workspace/AutoGaze/scripts/worker.py",
         *worker_args,
     ]
 
