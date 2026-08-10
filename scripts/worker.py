@@ -99,13 +99,17 @@ def load_video_frames(video_path: str, fps: float = 2.0, max_frames: int = 32):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default="dense",
-                        choices=["dense", "evs", "magnitude", "autogaze", "sparse_vit"])
+                        choices=["dense", "dense_eager", "evs", "magnitude", "autogaze", "sparse_vit"])
     parser.add_argument("--pruning-rate", type=float, default=0.5)
     parser.add_argument("--reps", type=int, default=1,
-                        help="Number of inference repetitions (first is warmup, rest are measured)")
+                        help="Number of inference repetitions")
+    parser.add_argument("--max-frames", type=int, default=32,
+                        help="Maximum video frames to sample (use 64 for full video)")
+    parser.add_argument("--fps", type=float, default=2.0,
+                        help="Frame sampling rate (use 25 to get all frames)")
     # Single-env flow: run AutoGaze preprocessing inline
     parser.add_argument("--video", default=None,
-                        help="Video path — triggers inline AutoGaze preprocessing (no external env needed)")
+                        help="Video path — triggers inline AutoGaze preprocessing")
     parser.add_argument("--gazing-ratio", type=float, default=0.245,
                         help="AutoGaze gazing ratio when running inline preprocessing")
     parser.add_argument("--mask", default=None,
@@ -115,6 +119,8 @@ def main():
     mode = args.mode
     pruning_rate = args.pruning_rate
     n_reps = max(1, args.reps)
+    max_frames = args.max_frames
+    fps = args.fps
 
     print(f"[approach5] mode={mode} pruning_rate={pruning_rate} reps={n_reps}", flush=True)
 
@@ -151,7 +157,7 @@ def main():
             print(f"[worker] Running AutoGaze inline on {args.video} ...", flush=True)
             from autogaze.vllm_integration.autogaze_preprocess import AutoGazePreprocessor
             _prep = AutoGazePreprocessor.load("nvidia/AutoGaze")
-            _raw = load_video_frames(args.video)
+            _raw = load_video_frames(args.video, fps=fps, max_frames=max_frames)
             mask_vit, K_vit = _prep.compute_retention_mask(
                 _raw, target_grid_hw=QWEN_VIT_GRID_HW,
                 gazing_ratio=args.gazing_ratio, seed=42,
@@ -187,7 +193,10 @@ def main():
         _patch_cls(llm=None)
 
     extra_kwargs = {}
-    if mode != "dense":
+    if mode == "dense_eager":
+        # Same as dense but with enforce_eager to isolate its overhead
+        extra_kwargs["enforce_eager"] = True
+    elif mode != "dense":
         extra_kwargs["video_pruning_rate"] = pruning_rate
         extra_kwargs["enforce_eager"] = True
 
@@ -218,7 +227,7 @@ def main():
 
     # ── CUDA event timing hook on ViT (all non-dense modes) ──────────────────
     from autogaze.vllm_integration.sparse_vit import patch_vit_timing, get_vit_ms
-    if mode != "dense":
+    if mode not in ("dense",):
         patch_vit_timing(llm)  # wraps current encoder.forward (after sparse patch if applied)
 
     # ── Build inference inputs ────────────────────────────────────────────────
@@ -227,11 +236,12 @@ def main():
         "role": "user",
         "content": [
             {"type": "video_url", "video_url": {
-                "url": video_url, "fps": 2.0, "max_pixels": 448 * 448, "nframes": 32,
+                "url": video_url, "fps": fps, "max_pixels": 448 * 448, "nframes": max_frames,
             }},
             {"type": "text", "text": PROMPT},
         ],
     }]
+    print(f"[worker] video: fps={fps} max_frames={max_frames}", flush=True)
     sampling = SamplingParams(max_tokens=10, temperature=0.0)
 
     from autogaze.vllm_integration.retention import AutoGazeContext

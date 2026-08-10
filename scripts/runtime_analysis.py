@@ -32,7 +32,8 @@ VLLM_IMAGE = "nvcr.io/nvidia/vllm:26.07-py3"
 
 
 def run_docker(mode: str, pruning_rate: float, reps: int,
-               gazing_ratio: float = 0.245) -> dict:
+               gazing_ratio: float = 0.245,
+               max_frames: int = 32, fps: float = 2.0) -> dict:
     """
     Run one mode in a Docker container.
     Returns the parsed RESULT_JSON dict augmented with wall_ms.
@@ -51,6 +52,8 @@ def run_docker(mode: str, pruning_rate: float, reps: int,
         "--mode", mode,
         "--pruning-rate", str(pruning_rate),
         "--reps", str(reps),
+        "--max-frames", str(max_frames),
+        "--fps", str(fps),
     ]
 
     if mode == "sparse_vit":
@@ -205,8 +208,12 @@ def main():
     parser.add_argument("--gazing-ratio", type=float, default=0.245)
     parser.add_argument("--modes", nargs="+",
                         default=["dense", "evs", "sparse_vit"],
-                        choices=["dense", "evs", "magnitude", "autogaze", "sparse_vit"],
+                        choices=["dense", "dense_eager", "evs", "magnitude", "autogaze", "sparse_vit"],
                         help="Modes to benchmark")
+    parser.add_argument("--max-frames", type=int, default=32,
+                        help="Max video frames (use 64 for full video)")
+    parser.add_argument("--fps", type=float, default=2.0,
+                        help="Frame sampling rate (use 25.0 for all frames)")
     args = parser.parse_args()
 
     pruning_rate = args.pruning_rate
@@ -231,6 +238,8 @@ def main():
                 pruning_rate=pruning_rate,
                 reps=reps,
                 gazing_ratio=args.gazing_ratio,
+                max_frames=args.max_frames,
+                fps=args.fps,
             )
             results.append(r)
             tok  = r.get("num_prompt_tokens", "?")
