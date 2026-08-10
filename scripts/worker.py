@@ -200,9 +200,9 @@ def main():
         max_model_len=8192,
         limit_mm_per_prompt={"video": 1},
         allowed_local_media_path="/workspace",
-        # Disable prefix caching so every rep measures a fresh forward pass.
-        # With caching on, reps 2+ hit the encoder cache (~40ms) and can give
-        # wrong answers when our retention-mask patches are bypassed.
+        # Disable text prefix caching for accurate benchmarking.
+        # Note: vLLM 0.24 also has a visual-token encoder cache (separate from
+        # prefix caching) which activates on reps 2+. Use --reps 1 to avoid it.
         enable_prefix_caching=False,
         **extra_kwargs,
     )

@@ -6,7 +6,6 @@ Runs three modes sequentially in NVIDIA vLLM Docker containers,
 with REPS inference passes each (first is warmup, rest are measured).
 
 Timing breakdown per mode:
-  preprocess_ms  — AutoGaze mask computation (outside Docker, auto_gaze env)
   load_ms        — vLLM model load (inside Docker)
   vit_ms         — Visual encoder forward (CUDA events, includes gather op for sparse_vit)
   lm_ms          — LLM prefill + decode  (elapsed_ms - vit_ms)
@@ -30,38 +29,10 @@ HF_CACHE = os.environ.get("HF_HOME", "/home/scratch.thannan_wwfo/hf_cache")
 RESULTS_FILE = os.path.join(REPO_DIR, "runtime_analysis.json")
 
 VLLM_IMAGE = "nvcr.io/nvidia/vllm:26.07-py3"
-AUTOGAZE_PYTHON = "/home/scratch.thannan_wwfo/miniforge-aarch64/envs/auto_gaze/bin/python"
-
-MASK_PATH_POST  = "/tmp/ag_mask_runtime.pt"       # 16×16 post-merge  (autogaze reference)
-MASK_PATH_VIT   = "/tmp/ag_mask_vit_runtime.pt"   # 32×32 pre-merge   (sparse_vit)
 
 
-def precompute_mask(grid_h: int, grid_w: int, output: str, pruning_rate: float) -> float:
-    """
-    Run AutoGaze preprocessing outside Docker.
-    Returns wall-clock time in ms.
-    """
-    video = os.path.join(REPO_DIR, "assets", "example_input.mp4")
-    cmd = [
-        AUTOGAZE_PYTHON,
-        os.path.join(REPO_DIR, "scripts", "run_autogaze_preprocess.py"),
-        "--video", video,
-        "--output", output,
-        "--gazing-ratio", str(pruning_rate),
-        "--grid-hw", str(grid_h), str(grid_w),
-    ]
-    print(f"\n[preprocess] grid={grid_h}×{grid_w} → {output}", flush=True)
-    t0 = time.perf_counter()
-    result = subprocess.run(cmd, capture_output=False, text=True)
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    if result.returncode != 0:
-        raise RuntimeError(f"AutoGaze preprocessing failed (exit {result.returncode})")
-    print(f"[preprocess] Done in {elapsed_ms:.0f} ms", flush=True)
-    return elapsed_ms
-
-
-def run_docker(mode: str, pruning_rate: float, reps: int, mask_path: str,
-               single_env: bool = False, gazing_ratio: float = 0.245) -> dict:
+def run_docker(mode: str, pruning_rate: float, reps: int,
+               gazing_ratio: float = 0.245) -> dict:
     """
     Run one mode in a Docker container.
     Returns the parsed RESULT_JSON dict augmented with wall_ms.
@@ -82,16 +53,11 @@ def run_docker(mode: str, pruning_rate: float, reps: int, mask_path: str,
         "--reps", str(reps),
     ]
 
-    if single_env and mode == "sparse_vit":
-        # Pass video path — worker runs AutoGaze preprocessing inline
+    if mode == "sparse_vit":
         worker_args += [
-            "--video", f"/workspace/AutoGaze/assets/example_input.mp4",
+            "--video", "/workspace/AutoGaze/assets/example_input.mp4",
             "--gazing-ratio", str(gazing_ratio),
         ]
-    elif mode in ("autogaze", "sparse_vit") and mask_path and os.path.exists(mask_path):
-        # Mount whichever mask file is needed (two-env flow)
-        vol_mounts += ["-v", f"{mask_path}:{mask_path}"]
-        env_vars  += ["-e", f"AUTOGAZE_MASK_PATH={mask_path}"]
 
     cmd = [
         "docker", "run", "--rm",
@@ -154,7 +120,6 @@ def print_report(results: list[dict], pruning_rate: float, reps: int) -> None:
         ("Mode",          "<12"),
         ("Tokens",        ">8"),
         ("vs Dense",      ">9"),
-        ("Preproc (ms)",  ">13"),
         ("Load (ms)",     ">10"),
         ("ViT (ms)",      ">10"),
         ("LM (ms)",       ">9"),
@@ -171,7 +136,6 @@ def print_report(results: list[dict], pruning_rate: float, reps: int) -> None:
         vit   = r.get("avg_vit_ms")   or r.get("vit_ms")
         lm    = r.get("avg_lm_ms")    or r.get("lm_ms")
         infer = r.get("avg_elapsed_ms") or r.get("elapsed_ms")
-        prep  = r.get("preprocess_ms")
         load  = r.get("load_ms")
 
         vs = (f"-{(1 - tok/dense_tok)*100:.0f}%"
@@ -180,12 +144,11 @@ def print_report(results: list[dict], pruning_rate: float, reps: int) -> None:
         vit_s  = f"{vit:.0f}" if vit else "n/a"
         lm_s   = f"{lm:.0f}"  if lm  else "n/a"
         inf_s  = f"{infer:.0f}" if infer else "n/a"
-        prep_s = f"{prep:.0f}" if prep else "n/a"
         load_s = f"{load:.0f}" if load else "n/a"
 
         print(
             f"  {r['mode']:<12}  {tok:>8}  {vs:>9}  "
-            f"{prep_s:>13}  {load_s:>10}  {vit_s:>10}  "
+            f"{load_s:>10}  {vit_s:>10}  "
             f"{lm_s:>9}  {inf_s:>11}  {r.get('answer','?'):>7}"
         )
 
@@ -244,42 +207,20 @@ def main():
                         default=["dense", "evs", "sparse_vit"],
                         choices=["dense", "evs", "magnitude", "autogaze", "sparse_vit"],
                         help="Modes to benchmark")
-    parser.add_argument("--single-env", action="store_true",
-                        help="Run AutoGaze preprocessing inside Docker (no auto_gaze env needed)")
     args = parser.parse_args()
 
     pruning_rate = args.pruning_rate
     reps = args.reps
     modes = args.modes
-    single_env = args.single_env
 
     print("=" * 70)
     print("Runtime Analysis — dense vs EVS vs sparse_vit")
     print("=" * 70)
-    print(f"Modes: {modes}  |  pruning_rate={pruning_rate}  |  reps={reps}  |  single_env={single_env}")
+    print(f"Modes: {modes}  |  pruning_rate={pruning_rate}  |  reps={reps}")
     print(f"Image: {VLLM_IMAGE}\n")
-
-    # ── Precompute masks (two-env flow only) ──────────────────────────────────
-    preprocess_times = {}
-
-    if not single_env:
-        if "autogaze" in modes:
-            t = precompute_mask(16, 16, MASK_PATH_POST, pruning_rate)
-            preprocess_times["autogaze"] = t
-
-        if "sparse_vit" in modes:
-            t = precompute_mask(32, 32, MASK_PATH_VIT, args.gazing_ratio)
-            preprocess_times["sparse_vit"] = t
 
     # ── Run each mode in Docker ───────────────────────────────────────────────
     results = []
-    mask_map = {
-        "dense":      None,
-        "evs":        None,
-        "magnitude":  None,
-        "autogaze":   MASK_PATH_POST,
-        "sparse_vit": MASK_PATH_VIT,
-    }
 
     for i, mode in enumerate(modes):
         if i > 0:
@@ -289,11 +230,8 @@ def main():
                 mode=mode,
                 pruning_rate=pruning_rate,
                 reps=reps,
-                mask_path=mask_map.get(mode) or "",
-                single_env=single_env,
                 gazing_ratio=args.gazing_ratio,
             )
-            r["preprocess_ms"] = preprocess_times.get(mode)
             results.append(r)
             tok  = r.get("num_prompt_tokens", "?")
             inf  = r.get("avg_elapsed_ms") or r.get("elapsed_ms", "?")
@@ -313,7 +251,6 @@ def main():
                 "avg_vit_ms": None,
                 "avg_lm_ms": None,
                 "load_ms": None,
-                "preprocess_ms": preprocess_times.get(mode),
                 "reps": [],
             })
 
