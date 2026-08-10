@@ -62,6 +62,7 @@ Usage:
 """
 from __future__ import annotations
 
+import os
 import threading
 from typing import Optional, Tuple
 
@@ -70,6 +71,12 @@ import torch.nn.functional as F
 
 _sparse_ctx = threading.local()
 _PATCHED_ENCODERS: dict = {}   # id(encoder) → original_forward
+
+# File used for cross-process mask communication.
+# vLLM V1 runs the ViT in an EngineCore subprocess; thread-locals set in the
+# main process are invisible there.  Writing the payload to this shared file
+# (inside the same Docker container) lets _sparse_vit_forward read it.
+_IPC_PATH = os.environ.get("SPARSE_VIT_IPC_PATH", "/tmp/_autogaze_sparse_vit_ctx.pt")
 
 # ---------------------------------------------------------------------------
 # CUDA event timing hook (used by runtime_analysis, independent of sparse ViT)
@@ -147,14 +154,35 @@ class SparseViTContext:
 
     def __enter__(self):
         _sparse_ctx.payload = self.payload
+        # Write to file so the EngineCore subprocess can read it.
+        # The mask tensor is already CPU; grid_thw is a plain tuple.
+        try:
+            torch.save(self.payload, _IPC_PATH)
+        except Exception as e:
+            print(f"[SparseViT] Warning: could not write IPC file {_IPC_PATH}: {e}", flush=True)
         return self
 
     def __exit__(self, *args):
         _sparse_ctx.payload = None
+        try:
+            if os.path.exists(_IPC_PATH):
+                os.unlink(_IPC_PATH)
+        except Exception:
+            pass
 
 
 def get_sparse_payload() -> Optional[dict]:
-    return getattr(_sparse_ctx, "payload", None)
+    # Fast path: thread-local (works when ViT runs in-process)
+    p = getattr(_sparse_ctx, "payload", None)
+    if p is not None:
+        return p
+    # Subprocess path: read from file written by main process
+    if os.path.exists(_IPC_PATH):
+        try:
+            return torch.load(_IPC_PATH, weights_only=True)
+        except Exception as e:
+            print(f"[SparseViT] Warning: could not read IPC file {_IPC_PATH}: {e}", flush=True)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -321,15 +349,39 @@ def _sparse_vit_forward(
     mask = mask.to(device)
 
     # ── Step 1: Patch embedding (all N patches — cheap) ───────────────────────
-    hidden_states = encoder.patch_embed(pixel_values)  # (total_vit, D)
+    hidden_states = encoder.patch_embed(pixel_values)  # (actual_total, D)
 
-    if hidden_states.shape[0] != total_vit:
-        print(
-            f"[SparseViT] Patch count mismatch: patch_embed gave {hidden_states.shape[0]}, "
-            f"expected {total_vit} (T={T}×H={H_vit}×W={W_vit}). Dense fallback.",
-            flush=True,
-        )
-        return _dense_from_embedded(encoder, hidden_states, None, grid_thw_arg)
+    actual_total = hidden_states.shape[0]
+    if actual_total != total_vit:
+        # vLLM's actual frame count differs from context (off-by-one is common).
+        # Try to adapt: if patch size H×W matches, truncate or pad the mask.
+        patches_per_frame = H_vit * W_vit
+        if patches_per_frame > 0 and actual_total % patches_per_frame == 0:
+            T_actual = actual_total // patches_per_frame
+            if T_actual <= T:
+                # Truncate mask to first T_actual frames
+                mask = mask[: T_actual * patches_per_frame]
+                K = int(mask.sum().item())
+                T = T_actual
+                print(
+                    f"[SparseViT] Adapted mask: T {payload['grid_thw'][0]}→{T_actual} "
+                    f"({actual_total} patches, K={K})",
+                    flush=True,
+                )
+            else:
+                # More actual frames than mask — dense fallback
+                print(
+                    f"[SparseViT] T_actual={T_actual} > mask T={T}. Dense fallback.",
+                    flush=True,
+                )
+                return _dense_from_embedded(encoder, hidden_states, None, grid_thw_arg)
+        else:
+            print(
+                f"[SparseViT] Patch count mismatch: got {actual_total}, "
+                f"expected {total_vit} (T={T}×{H_vit}×{W_vit}). Dense fallback.",
+                flush=True,
+            )
+            return _dense_from_embedded(encoder, hidden_states, None, grid_thw_arg)
 
     # ── Step 2: Rotary position embeddings for all positions ──────────────────
     rotary_pos_emb: Optional[torch.Tensor] = None
@@ -348,8 +400,8 @@ def _sparse_vit_forward(
 
     hidden_sparse = hidden_states[selected_idx]  # (K, D)
     print(
-        f"[SparseViT] Gather: {total_vit} → {K} patches "
-        f"({K / total_vit * 100:.1f}% retained before ViT blocks)",
+        f"[SparseViT] Gather: {actual_total} → {K} patches "
+        f"({K / actual_total * 100:.1f}% retained before ViT blocks)",
         flush=True,
     )
 
@@ -382,8 +434,8 @@ def _sparse_vit_forward(
 
     K_merged = hidden_sparse.shape[0]
     print(
-        f"[SparseViT] Output: {total_vit} patches → {K} sparse → {K_merged} merged tokens "
-        f"(vs dense {total_vit // 4} merged tokens)",
+        f"[SparseViT] Output: {actual_total} patches → {K} sparse → {K_merged} merged tokens "
+        f"(vs dense {actual_total // 4} merged tokens)",
         flush=True,
     )
     return hidden_sparse
