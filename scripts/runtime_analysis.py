@@ -110,10 +110,10 @@ def print_report(results: list[dict], pruning_rate: float, reps: int) -> None:
     print()
 
     dense = next((r for r in results if r["mode"] == "dense"), None)
-    dense_tok  = dense["num_prompt_tokens"] if dense else None
-    dense_vit  = dense.get("avg_vit_ms") or dense.get("vit_ms")
-    dense_lm   = dense.get("avg_lm_ms")  or dense.get("lm_ms")
-    dense_inf  = dense.get("avg_elapsed_ms") or dense.get("elapsed_ms")
+    dense_tok  = dense["num_prompt_tokens"] if dense and dense.get("num_prompt_tokens", -1) > 0 else None
+    dense_vit  = dense.get("avg_vit_ms") or dense.get("vit_ms") if dense else None
+    dense_lm   = dense.get("avg_lm_ms")  or dense.get("lm_ms")  if dense else None
+    dense_inf  = dense.get("avg_elapsed_ms") or dense.get("elapsed_ms") if dense else None
 
     # Header
     cols = [
@@ -236,7 +236,7 @@ def main():
             tok  = r.get("num_prompt_tokens", "?")
             inf  = r.get("avg_elapsed_ms") or r.get("elapsed_ms", "?")
             ans  = r.get("answer", "?")
-            print(f"\n  ✓ {mode}: tokens={tok}  infer={inf:.0f}ms  answer={ans}")
+            print(f"\n  ✓ {mode}: tokens={tok}  infer={f'{inf:.0f}ms' if inf else 'n/a'}  answer={ans}")
         except Exception as exc:
             print(f"\n  ✗ {mode}: FAILED — {exc}")
             results.append({
