@@ -200,6 +200,10 @@ def main():
         max_model_len=8192,
         limit_mm_per_prompt={"video": 1},
         allowed_local_media_path="/workspace",
+        # Disable prefix caching so every rep measures a fresh forward pass.
+        # With caching on, reps 2+ hit the encoder cache (~40ms) and can give
+        # wrong answers when our retention-mask patches are bypassed.
+        enable_prefix_caching=False,
         **extra_kwargs,
     )
     load_ms = (time.perf_counter() - t_load) * 1000
