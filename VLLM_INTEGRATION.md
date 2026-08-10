@@ -1,96 +1,160 @@
-# AutoGaze × vLLM Integration
+# AutoGaze × vLLM — Sparse ViT Integration
 
-Integrates `nvidia/AutoGaze` with vLLM to run the Qwen3-VL visual encoder sparsely —
-selecting patches **before** the transformer blocks rather than pruning after.
+**Branch:** `vllm-integration-experiments` · **Updated:** 2026-08-10
+
+Integrates `nvidia/AutoGaze` with vLLM to run the Qwen3-VL visual encoder **sparsely** —
+selecting K patches before the transformer blocks via a gather op, instead of pruning after.
+
+---
+
+## Results
+
+**Model:** `Qwen/Qwen3-VL-2B-Instruct` · **Video:** 6 frames, 448×448 · **GPU:** GB200  
+**Method:** 3 reps, warmup excluded, CUDA events for ViT/LM split
+
+| Mode | Tokens | vs Dense | ViT (ms) | LM (ms) | Infer (ms) | Answer |
+|---|---:|:---:|---:|---:|---:|:---:|
+| dense | 670 | — | n/a | n/a | 17,320 | C |
+| evs (q=0.5) | 376 | −44% | 3,189 | 13,649 | 16,838 | C |
+| **sparse\_vit (ratio=0.245)** | **356** | **−47%** | **690** | **13,526** | **14,216** | **C** |
+
+`infer_ms` excludes model load (~26 s). All modes answer correctly.
+
+- **ViT: 4.6× faster** — 690 ms vs 3,189 ms. Scales as (K/N)² ≈ (0.216)² ≈ 4.7×.
+- **LM: unchanged** — same token count to the LLM → same decode cost.
+- **Net: 15% faster** than EVS end-to-end.
+
+**Why `ratio=0.5` was slower than EVS (gotcha):** EVS `q=0.5` keeps ~25% of merged tokens
+(376). AutoGaze `ratio=0.5` targets 44% of ViT patches → 681 merged tokens → more LM work.
+Use `ratio≈0.245` to match EVS's token count. See [Parameter guide](#parameters) below.
+
+**AutoGaze's adaptive K:** At the same `ratio=0.245`, two runs gave different K:
+
+| Run | K\_vit | Retention | Tokens | Infer (ms) |
+|---|---:|:---:|---:|---:|
+| A | 1,326 | 21.6% | 356 | 14,216 |
+| B | 433 | 7.0% | 133 | 13,265 |
+
+Run B's `task_loss_prediction_head` stopped at 7% — it learned that was enough for this
+question. Both correct. Run B is 21% faster than EVS with 80% fewer tokens than dense.
+
+---
 
 ## Architecture
 
 ```
-outside Docker  (auto_gaze conda env)
+OUTSIDE DOCKER  (auto_gaze conda env, transformers 4.x)
+────────────────────────────────────────────────────────
   video frames
-    → AutoGaze (tiny LLaMA decoder)
-    → per-frame patch mask  (T × H_vit × W_vit)  bool
-    → saved to /tmp/ag_mask_vit.pt
+    ↓ AutoGaze (ShallowVideoConvNet + LLaMA-4L)
+  gazing_mask (T, 14, 14)  ← per-frame, task-driven early stopping
+    ↓ bilinear upsample → ViT patch grid (32×32)
+  ag_mask_vit.pt  ──────────────────────────────────────┐
+                                                         │ file on disk
+INSIDE DOCKER  (nvcr.io/nvidia/vllm:26.07-py3)          │
+────────────────────────────────────────────────────────┘
+  from vllm import LLM
+  apply_autogaze_patch()       ← monkey-patches vllm.multimodal.evs
+  patch_sparse_vit(llm=None)   ← class-level patch before LLM() [vLLM V1]
+  LLM(video_pruning_rate=0.245, enforce_eager=True)
 
-inside Docker  (nvcr.io/nvidia/vllm:26.07-py3)
-  patch_embed(all N patches)    ← cheap conv, runs on everything
-    → GATHER K selected patches  ← AutoGaze mask
-    → transformer blocks(K)      ← O(K²) attention, not O(N²)
-    → spatial merger             ← K → K/4 merged tokens
-    → LLM                        ← K/4 visual tokens
+  inside SparseViTContext + AutoGazeContext:
+
+  pixel_values (T × 32×32 patches)
+    ↓ patch_embed    [all N — cheap conv]
+    ↓ GATHER K       [from ag_mask_vit.pt]      ← K varies per video/frame
+    ↓ blocks(K)      [O(K²) vs dense O(N²)]
+    ↓ merger         [K → K/4 merged tokens]
+    ↓ LLM            [K/4 visual tokens → answer]
 ```
 
-**ViT speedup:** proportional to `(K/N)²` for attention. At 21.6% retention: **4.6× faster ViT**.  
-**End-to-end:** 15% faster than EVS at matched token count (ratio=0.245 vs EVS q=0.5).
+**Three things patched in vLLM:**
+
+| Hook | What changes | File |
+|---|---|---|
+| `compute_retained_tokens_count` | Returns AutoGaze's actual K, not fixed formula | `retention.py` |
+| `compute_retention_mask` | Returns identity mask (ViT already selected) | `retention.py` |
+| `Qwen2_5VLVisionTransformer.forward` | Applies gather op before transformer blocks | `sparse_vit.py` |
+
+---
 
 ## Quick start
 
 ```bash
-# 1. Compute AutoGaze mask (auto_gaze conda env, outside Docker)
+# Step 1 — compute AutoGaze mask (auto_gaze env, outside Docker)
 /path/to/auto_gaze/python scripts/run_autogaze_preprocess.py \
     --video assets/example_input.mp4 \
     --output /tmp/ag_mask_vit.pt \
     --grid-hw 32 32 \
     --gazing-ratio 0.245
 
-# 2. Run benchmark (launches Docker automatically)
+# Step 2 — benchmark all three modes (launches Docker automatically)
 python scripts/runtime_analysis.py --modes dense evs sparse_vit --reps 3
 
-# 3. Tune gazing ratio
+# Step 3 — sweep a specific ratio, reuse cached dense/EVS baseline
 python scripts/compare_sparse_vit_ratio.py --gazing-ratio 0.245 --reps 3
 ```
+
+---
 
 ## Files
 
 ```
 autogaze/vllm_integration/
-  autogaze_preprocess.py   AutoGazePreprocessor — runs AutoGaze, outputs (T×H×W) bool mask
-  patch.py                 apply_autogaze_patch() — replaces vLLM's EVS hooks
-  retention.py             AutoGazeContext, autogaze_retained_tokens_count (adaptive K)
-  sparse_vit.py            SparseViTContext, patch_sparse_vit() — gather op before ViT blocks
+  autogaze_preprocess.py   AutoGazePreprocessor.compute_retention_mask()
+  patch.py                 apply_autogaze_patch() — patches both EVS hooks
+  retention.py             AutoGazeContext · autogaze_retained_tokens_count
+  sparse_vit.py            SparseViTContext · patch_sparse_vit() · patch_vit_timing()
 
 scripts/
-  run_autogaze_preprocess.py   run AutoGaze preprocessing (auto_gaze env, outside Docker)
+  run_autogaze_preprocess.py   run AutoGaze outside Docker (auto_gaze env)
   worker.py                    vLLM inference worker (runs inside Docker)
   runtime_analysis.py          benchmark: dense vs EVS vs sparse_vit
-  compare_sparse_vit_ratio.py  sweep gazing_ratio, compare against cached EVS baseline
+  compare_sparse_vit_ratio.py  tune ratio, reuse cached baseline
 ```
 
-## Benchmark results
+---
 
-Model: `Qwen/Qwen3-VL-2B-Instruct` · Video: 6 frames · GB200 · reps=3 (warmup excluded)
+## Parameters
 
-| Mode | Tokens | ViT (ms) | LM (ms) | Infer (ms) |
-|---|---:|---:|---:|---:|
-| dense | 670 | n/a | n/a | 17,320 |
-| evs (q=0.5) | 376 | 3,189 | 13,649 | 16,838 |
-| **sparse_vit (ratio=0.245)** | **356** | **690** | **13,526** | **14,216** |
-
-sparse_vit at ratio=0.245 beats EVS: **4.6× faster ViT**, same LM cost, **15% faster overall**.
-
-## Key parameters
-
-| Parameter | Where | What it controls |
+| Parameter | Where | Effect |
 |---|---|---|
-| `gazing_ratio` | `run_autogaze_preprocess.py` | Fraction of patches AutoGaze targets per frame. Actual K may be lower due to early stopping. |
-| `--grid-hw H W` | `run_autogaze_preprocess.py` | ViT patch grid size. Use `32 32` for sparse_vit (pre-merge), `16 16` for post-ViT autogaze. |
-| `seed` | `compute_retention_mask()` | Random seed for reproducible K (default 42). AutoGaze generation is stochastic. |
-| `--reps N` | `worker.py` | Inference repetitions. Rep 1 = warmup; reps 2+ are measured. |
+| `--gazing-ratio` | `run_autogaze_preprocess.py` | Soft target patch fraction. Actual K may be lower due to early stopping. Use `≈0.245` to match EVS token count. |
+| `--grid-hw H W` | `run_autogaze_preprocess.py` | ViT patch grid: `32 32` for sparse\_vit (pre-merge), `16 16` for post-ViT autogaze mode. |
+| `seed` | `compute_retention_mask(seed=42)` | Fixes random seed for reproducible K within a run. |
+| `--reps N` | `worker.py` | Inference repetitions. Rep 1 = warmup. |
+
+**`gazing_ratio` vs EVS `q` are not the same thing:**
+
+| Parameter | Controls |
+|---|---|
+| EVS `q=0.5` | Keep top 50% of post-merge tokens by cosine similarity → fixed K |
+| AutoGaze `ratio=0.5` | *Target* 50% retention per frame, stop early if confident → variable K |
+
+---
 
 ## Implementation notes
 
-**Adaptive K (Task 1):** `autogaze_retained_tokens_count` is monkey-patched over vLLM's
-`compute_retained_tokens_count` so vLLM pre-allocates exactly K KV-cache slots per video,
-not a fixed formula. This requires `AutoGazeContext(K=K_merged)` to be active.
+**Adaptive K:** `autogaze_retained_tokens_count` is monkey-patched over vLLM's
+`compute_retained_tokens_count`. When `AutoGazeContext(K=K_merged)` is active, vLLM
+pre-allocates K KV-cache slots instead of the formula-derived count.
 
-**Class-level patch (vLLM ≥0.24 V1 engine):** The visual encoder runs in an `EngineCore`
-subprocess. `patch_sparse_vit(llm=None)` patches the class before `LLM()` is called so the
-patch is inherited by the subprocess. Must run after `from vllm import LLM`.
+**Class-level patch (vLLM ≥0.24 V1):** The visual encoder runs in an `EngineCore`
+subprocess. Call `patch_sparse_vit(llm=None)` **after** `from vllm import LLM` but **before**
+`LLM(...)` so the class patch is inherited when the subprocess instantiates the model.
 
-**Two ViT grid sizes:**
-- `--grid-hw 32 32` (pre-merge): mask at ViT patch level; used by sparse_vit. K_merged = K_vit / 4.
-- `--grid-hw 16 16` (post-merge): mask at merged-token level; used by post-ViT autogaze mode.
+**AutoGaze K is stochastic:** The `task_loss_prediction_head` stops early based on CUDA
+random state. Pin `seed=42` for within-run reproducibility. Use `task_loss_requirement`
+(a quality-floor threshold) for more principled stopping.
 
-**AutoGaze stochasticity:** The model's `task_loss_prediction_head` stops patch selection
-early when confident. K can vary across runs even at the same ratio. Pin `seed=42` for
-reproducibility or use `task_loss_requirement` for a quality-floor stopping criterion.
+**vLLM 0.24+ signature change:** `compute_retained_tokens_count` is called with
+`num_frames=N` as a keyword arg. Our replacement accepts both the old positional `T` and the
+new `num_frames=` kwarg.
+
+---
+
+## Next steps
+
+1. Upstream vLLM PR: add `token_count` field to `ModalityInput`
+2. Accuracy benchmark on EgoSchema / Video-MME (not just one question)
+3. Replace `gazing_ratio` with `task_loss_requirement` for quality-floor stopping
