@@ -206,7 +206,7 @@ def main():
         model=MODEL_ID,
         dtype="bfloat16",
         gpu_memory_utilization=0.7,
-        max_model_len=8192,
+        max_model_len=32768,
         limit_mm_per_prompt={"video": 1},
         allowed_local_media_path="/workspace",
         # Disable text prefix caching for accurate benchmarking.

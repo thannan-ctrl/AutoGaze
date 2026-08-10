@@ -231,7 +231,7 @@ def main():
 
     for i, mode in enumerate(modes):
         if i > 0:
-            time.sleep(5)  # brief pause so GPU state resets between containers
+            time.sleep(15)  # pause so GPU fully releases between containers
         try:
             r = run_docker(
                 mode=mode,
