@@ -42,13 +42,13 @@ Three hooks monkey-patched in vLLM: `Qwen2_5VLVisionTransformer.forward` (gather
 ## Key findings
 
 
-**2. GPU AutoGaze is near break-even E2E (+1.7%).**  
+**1. GPU AutoGaze is near break-even E2E (+1.7%).**  
 ~1.2 s AutoGaze overhead on GB200 partially offsets the 943 ms inference savings → sparse_vit is only **234 ms slower** than dense_eager. Within run-to-run noise.
 
-**3. `enforce_eager` costs 156 ms — sparse_vit still beats plain dense.**  
+**2. `enforce_eager` costs 156 ms — sparse_vit still beats plain dense.**  
 Even with CUDA graphs disabled (required for pruning hooks), sparse_vit inference (12,661 ms) is **5.9% faster than dense** (13,448 ms, CUDA graphs on).
 
-**4. At the same latency, sparse_vit processes 7× more video.**  
+**3. At the same latency, sparse_vit processes 7× more video.**  
 878 vs 6,403 tokens at 32 frames (**7.3× reduction**, same answer quality). Within a ~13.6 s budget, sparse_vit scales to ~230 frames where dense caps at 32.
 
 ---
@@ -62,10 +62,9 @@ Even with CUDA graphs disabled (required for pruning hooks), sparse_vit inferenc
 
 ## Next steps
 
-| Priority | Action | Expected impact |
-|---|---|---|
-| High | Run AutoGaze on GPU (fix deployment) | Already demonstrated: E2E within noise of dense\_eager |
-| High | Quantize / batch AutoGaze decoder (INT8, larger chunks) | AutoGaze GPU: 1–2 s → <500 ms → clear net E2E speedup |
-| High | Remove `enforce_eager` dependency (upstream vLLM PR) | Recover 156 ms; enable CUDA graphs for sparse\_vit |
-| Medium | Benchmark EgoSchema / Video-MME | Validate accuracy at high compression ratios |
-| Low | Fix ViT timing IPC | Directly confirm attention-layer speedup |
+| Action | Expected impact |
+|---|---|
+| Quantize / batch AutoGaze decoder (INT8, larger chunks) | AutoGaze GPU: 1–2 s → <500 ms → clear net E2E speedup |
+| Remove `enforce_eager` dependency (upstream vLLM PR) | Recover 156 ms; enable CUDA graphs for sparse\_vit |
+| Benchmark EgoSchema / Video-MME | Validate accuracy at high compression ratios |
+| Fix ViT timing IPC | Directly confirm attention-layer speedup |
