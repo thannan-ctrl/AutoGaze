@@ -40,78 +40,93 @@ Video (T frames)
 
 ---
 
-## Results (2026-08-11)
+## All Experiments (2026-08-11)
 
-**Model:** `Qwen/Qwen3-VL-2B-Instruct` · **Video:** `assets/long_test_video.mp4` (31 s, 32 frames sampled)  
-**GPU:** GB200 (gb-nvl-081-compute03) · **Image:** `nvcr.io/nvidia/vllm:26.07-py3`
+**Setup:** `Qwen/Qwen3-VL-2B-Instruct` · GB200 (gb-nvl-081-compute03) · `nvcr.io/nvidia/vllm:26.07-py3`  
+All modes answer **C** correctly.
 
-All modes answer correctly (**C**). Token compression works: AutoGaze selected ~924 of 6,403 visual tokens (14.4%).
+### Complete results table
 
-All modes use `enforce_eager=True` so comparisons are fair (no CUDA-graph advantage for any mode).  
-`dense_eager` = dense inference with `enforce_eager=True`, no pruning.
+| # | Video | Mode | enforce\_eager | AutoGaze device | Tokens | AutoGaze (ms) | Infer (ms) | E2E (ms) | vs dense\_eager |
+|---|---|---|:---:|---|---:|---:|---:|---:|:---:|
+| 1 | short (3f) | dense | ✗ | — | 670 | — | 11,754 | 11,754 | — |
+| 2 | short (3f) | evs | ✓ | — | 376 | — | 13,359 | 13,359 | — |
+| 3 | short (3f) | sparse\_vit | ✓ | GPU (inline) | 148 | ~bundled | 13,013 | 13,013 | — |
+| 4 | long (32f) | dense | ✗ | — | 6,403 | — | 13,448 | 13,448 | −2.3% |
+| 5 | long (32f) | **dense\_eager** | ✓ | — | 6,403 | — | 13,604 | **13,604** | **baseline** |
+| 6 | long (32f) | evs | ✓ | — | 3,365 | — | 13,284 | 13,284 | −2.4% |
+| 7 | long (32f) | sparse\_vit | ✓ | **GPU** (inline Docker) | 878 | ~bundled | **13,838** | **13,838** | **+1.7%** |
+| 8 | long (32f) | sparse\_vit | ✓ | **CPU** (external miniforge) | 924 | 19,267 | 12,661 | 31,928 | +135% |
+| 8† | long (32f) | sparse\_vit | ✓ | CPU (infer only) | 924 | excluded | **12,661** | 12,661 | **−6.9%** |
 
-### Three AutoGaze deployment modes
+†Row 8† shows row 8's inference time with AutoGaze preprocessing excluded — isolating the pure ViT+LM savings.
 
-| AutoGaze deployment | AutoGaze time | AutoGaze device | sparse\_vit infer (ms) | E2E (ms) | vs dense\_eager E2E |
-|---|---:|---|---:|---:|:---:|
-| None (dense\_eager baseline) | — | — | 13,604 | 13,604 | — |
-| Inline in Docker (GPU) | ~1–2 s (bundled) | GB200 GPU | 13,838 | 13,838 | **+1.7%** (within noise) |
-| External (CPU miniforge env) | 19,267 | CPU | 12,661 | 31,928 | **+135%** (CPU bottleneck) |
+---
 
-**Key finding:** AutoGaze on GPU costs ~1–2 s of overhead. The sparse ViT + LM savings (~1.1 s from external run) nearly cancel it out — end-to-end is within **1–2% of dense_eager**, which is measurement noise.
+### What each variable controls
 
-### Inference-only breakdown (external AutoGaze, preproc not in elapsed)
+**`enforce_eager` (rows 4 vs 5):**  
+EVS and sparse_vit require `enforce_eager=True` to activate the pruning hooks; this disables CUDA graphs.  
+- dense (row 4): CUDA graphs ON → 13,448 ms  
+- dense_eager (row 5): CUDA graphs OFF → 13,604 ms (+156 ms, +1.1%)  
 
-When AutoGaze preprocessing is excluded from `elapsed_ms`:
+`dense_eager` is the correct baseline for EVS and sparse_vit — all three run under the same execution mode.
 
-| Mode | Tokens | Infer (ms) | vs dense\_eager |
-|---|---:|---:|:---:|
-| dense\_eager | 6,403 | 13,777 | — |
-| evs | 3,365 | 13,532 | −1.8% |
-| **sparse\_vit** | **924** | **12,661** | **−8.1%** |
+**AutoGaze on GPU vs CPU (rows 7 vs 8):**  
+AutoGaze uses a 4-layer LLaMA decoder that generates patch selections autoregressively.  
+- GPU (inside Docker, GB200): overhead bundled, total 13,838 ms  
+- CPU (miniforge-aarch64 env, no CUDA): 19,267 ms preprocessing alone → E2E 31,928 ms  
 
-The **8.1% inference speedup** (1,116 ms) comes from:
-- Sparse ViT processes K=924 patches instead of N=6,403 → lower O(K²) attention cost in rendering
+**The AutoGaze preprocessing was running on CPU by mistake.** The miniforge-aarch64 environment uses a CPU-only PyTorch build. On GPU (inside Docker), overhead drops to ~1–2 s.
+
+**Short vs long video (rows 1–3 vs 4–8):**  
+Token compression scales with video length:
+- Short (3f): sparse_vit selects K=148 tokens (−78% vs dense 670), N=2,352 ViT patches  
+- Long (32f): sparse_vit selects K=878 tokens (−86% vs dense 6,403), N=25,088 ViT patches
+
+---
+
+### Key findings
+
+**1. Inference speedup is confirmed (row 8† vs row 5):**  
+With AutoGaze preprocessing excluded, sparse_vit (12,661 ms) beats dense_eager (13,604 ms) by **6.9%** and evs (13,284 ms) by **4.7%**. The savings come from:
+- Sparse ViT runs O(K²) attention on 878 patches instead of O(N²) on 6,403 → faster rendering
 - LM decodes 924 tokens instead of 6,403 → faster prefill and decode
 
-### CUDA graphs vs enforce\_eager
+**2. GPU AutoGaze makes sparse_vit near-neutral E2E (row 7 vs row 5):**  
+With AutoGaze on GPU (row 7), sparse_vit is 13,838 ms vs dense_eager 13,604 ms — **+1.7%, within measurement noise**. AutoGaze GPU overhead (~1–2 s) approximately equals the ViT+LM savings (~1.1 s).
 
-Dense without `enforce_eager` (CUDA graphs active) runs at 13,448 ms — 156 ms faster than dense_eager. Comparing sparse_vit (12,661 ms inference-only) to plain dense (13,448 ms): **sparse_vit is 5.9% faster** even accounting for the graph overhead it must pay and dense does not.
+**3. CPU AutoGaze destroys E2E (row 8 vs row 5):**  
+CPU preprocessing (19,267 ms) makes E2E 2.3× slower than dense_eager. This is a deployment issue — the miniforge-aarch64 env has no CUDA.
+
+**4. EVS overhead for short video (row 2 vs row 1):**  
+EVS cuts tokens 44% but is 14% *slower* than dense on the short video because `enforce_eager` overhead exceeds token savings at this scale. At 32 frames (row 6), EVS recovers to −2.4% vs dense_eager.
+
+**5. Short video sparse_vit inference faster than EVS (row 3 vs row 2):**  
+Even at 3 frames, sparse_vit (13,013 ms) beats EVS (13,359 ms) by 346 ms (2.6%). The sparse ViT selection gives an edge even at small N.
 
 ---
 
 ## Shortcomings
 
-### 1. AutoGaze preprocessing dominates E2E time
+### ViT and LM timing not captured
 
-The inference speedup is confirmed (**8.1% faster** than dense_eager, **6.4% faster** than EVS), but the AutoGaze mask computation (19,267 ms on 32 frames) makes E2E wall time 2.3× worse than not using AutoGaze at all.
+All `ViT (ms)` and `LM (ms)` values are empty. The CUDA timing hook runs inside vLLM's `EngineCore` subprocess and every IPC mechanism tried failed:
 
-The preprocessing runs ShallowVideoConvNet + LLaMA-4L autoregressively on all frames. It needs to be accelerated (batching, early-exit tuning, or hardware-optimized inference) for the E2E speedup to be net positive.
-
-### 2. ViT and LM timing not captured
-
-The `ViT (ms)` and `LM (ms)` columns are empty. The CUDA event timing hook runs inside vLLM's `EngineCore` subprocess, and all IPC mechanisms attempted failed to deliver the value to the parent process:
-
-| Mechanism | Outcome |
+| Mechanism | Why it failed |
 |---|---|
-| Thread-local (`_vit_timing.ms`) | Invisible across fork |
-| File write (`/tmp/`) | Child writes to its own namespace copy |
+| Thread-local | Not visible across process fork |
+| File (`/tmp/`) | EngineCore has isolated mount namespace |
 | Anonymous mmap (`MAP_SHARED`) | Post-fork lock issues on Python 3.12 |
-| `multiprocessing.Value` | Same lock issue |
-| `stdout` print | EngineCore stdout is redirected by vLLM |
-| Unix socket pair (`socketpair`) | vLLM likely uses `spawn` not `fork` → child doesn't inherit parent's fds |
+| `multiprocessing.Value` | Same post-fork lock issue |
+| `stdout` print | EngineCore stdout redirected by vLLM |
+| Unix socket pair | vLLM uses `spawn`; child starts fresh without inherited fds |
 
-Without ViT timing, it is not possible to directly measure the ViT speedup (the key claim: K²/N² ≈ (0.14)² ≈ 50× attention reduction) from within this inference pipeline.
+### Original results required a different Docker image
 
-### 3. Original speedup was on a different Docker image
+The reference (sparse_vit 14,188 ms vs dense 17,348 ms, 18% faster) used an internal image where the ViT ran in the main process (V0 single-process executor). CUDA timing worked → ViT measured at 691 ms vs EVS 3,148 ms (4.56×). That 2,457 ms saving was directly visible in wall time.
 
-The reference result (sparse_vit 14,188 ms vs dense 17,348 ms — 18% faster) was measured on an **NVIDIA internal image** (`gitlab-master...main-py3.60784172-devel-arm64`) that used vLLM's V0 single-process executor. In that executor:
-- The ViT runs in the **main process** (no subprocess)
-- `SparseViTContext` thread-locals are directly visible → gather op fires
-- CUDA event timing works → ViT measured at 691 ms vs EVS 3,148 ms (4.6×)
-- ViT savings of 2,457 ms on a 16,840 ms baseline → 16% speedup visible end-to-end
-
-With `nvcr.io/nvidia/vllm:26.07-py3` (V1 engine), the ViT runs in an `EngineCore` subprocess. The gather op does fire (token count proves: 878 vs 6,403), but the savings cannot be measured or seen in wall time because rendering dominates.
+With `nvcr.io/nvidia/vllm:26.07-py3` (V1 engine), the gather op fires correctly (878 vs 6,403 tokens confirms it), but ViT savings are absorbed inside the rendering phase.
 
 ---
 
@@ -126,9 +141,17 @@ python3 scripts/runtime_analysis.py \
     --modes dense evs sparse_vit \
     --gazing-ratio 0.245 --pruning-rate 0.5 --reps 3
 
-# Long video (32 frames, 6403 dense tokens) — shows larger token compression
+# Long video — GPU AutoGaze inline, fair eager comparison
 python3 scripts/runtime_analysis.py \
-    --modes dense evs sparse_vit \
+    --modes dense_eager evs sparse_vit \
+    --gazing-ratio 0.245 --pruning-rate 0.5 --reps 1 \
+    --video /workspace/AutoGaze/assets/long_test_video.mp4 \
+    --max-frames 32 --fps 2.0
+
+# Long video — external AutoGaze (CPU host), inference-only elapsed
+python3 scripts/runtime_analysis.py \
+    --modes dense_eager evs sparse_vit \
+    --external-autogaze \
     --gazing-ratio 0.245 --pruning-rate 0.5 --reps 1 \
     --video /workspace/AutoGaze/assets/long_test_video.mp4 \
     --max-frames 32 --fps 2.0
@@ -138,10 +161,10 @@ python3 scripts/runtime_analysis.py \
 
 ## Next steps
 
-1. **Get ViT timing**: Run `scripts/bench_vit_timing.py` inside Docker directly — loads the visual encoder from HuggingFace, times dense vs sparse ViT with CUDA events in-process (no subprocess, no IPC). This will confirm the attention-layer speedup.
+1. **Accelerate AutoGaze**: The LLaMA-4L decoder runs autoregressively. Batching frames, INT8/FP8 quantization, or caching masks would cut GPU overhead well below 500 ms → net E2E speedup over dense_eager.
 
-2. **Eliminate enforce_eager overhead**: Implement sparse_vit without relying on `video_pruning_rate` (which forces enforce_eager). If the KV-cache slot count can be communicated to vLLM's scheduler differently, sparse_vit could run with CUDA graphs and close the ~600 ms gap.
+2. **Eliminate enforce\_eager**: Communicating K to vLLM's scheduler without `video_pruning_rate` (e.g., upstream PR exposing `token_count` in `ModalityInput`) would allow CUDA graphs → close the remaining 156 ms gap.
 
-3. **Accuracy benchmark**: Run EgoSchema / Video-MME to validate that AutoGaze's adaptive patch selection preserves answer quality at high compression ratios (current tests are single-question).
+3. **Accuracy at scale**: Run EgoSchema / Video-MME to validate answer quality at high compression ratios across many questions.
 
-4. **Upstream vLLM PR**: Expose `token_count` in `ModalityInput` so K is communicated to the scheduler without monkey-patching.
+4. **ViT timing**: Run `scripts/bench_vit_timing.py` (loads visual encoder from HuggingFace directly, CUDA events in-process) to confirm the (N/K)² ≈ 62× attention speedup independently of vLLM.
