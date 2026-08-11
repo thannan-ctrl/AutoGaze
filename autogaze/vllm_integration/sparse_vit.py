@@ -62,8 +62,8 @@ Usage:
 """
 from __future__ import annotations
 
-import mmap
 import os
+import socket
 import struct
 import threading
 from typing import Optional, Tuple
@@ -80,23 +80,33 @@ _PATCHED_ENCODERS: dict = {}   # id(encoder) → original_forward
 # (inside the same Docker container) lets _sparse_vit_forward read it.
 _IPC_PATH = os.environ.get("SPARSE_VIT_IPC_PATH", "/tmp/_autogaze_sparse_vit_ctx.pt")
 
-# Anonymous mmap for cross-process ViT timing.
-# mmap(-1, 8) on Linux uses MAP_ANONYMOUS|MAP_SHARED — the physical page is
-# shared between parent and child after fork, so child writes are visible
-# to parent immediately.  multiprocessing.Value has post-fork lock issues on
-# Python 3.12; raw mmap avoids them.
-# Must be created BEFORE fork (i.e., before LLM()).
-_vit_timing_buf: Optional[mmap.mmap] = None
-_VIT_TIMING_SENTINEL = -1.0
+# Socket pair for cross-process ViT timing.
+#
+# Approach: create a connected Unix socket pair BEFORE LLM() forks the
+# EngineCore subprocess.  After fork both processes share the same
+# underlying sockets (file descriptors are inherited).  The child writes
+# the timing float via the "send" socket; the parent reads it from the
+# "recv" socket.  Unlike mmap, stdout-print, or filesystem approaches,
+# socketpair() is unaffected by:
+#   - vLLM's internal stdout/stderr redirection in the EngineCore
+#   - mount-namespace isolation (AF_UNIX sockets are in the abstract
+#     namespace, not the filesystem)
+#   - Python 3.12 post-fork lock issues (no locking involved)
+#
+# Layout: _timing_socks = (recv_sock, send_sock)
+#   parent → recv from index 0
+#   child  → send  via index 1
+_timing_socks: Optional[tuple] = None
 
 
-def setup_timing_shm() -> mmap.mmap:
-    """Create the shared-memory timing buf (call once, before LLM())."""
-    global _vit_timing_buf
-    if _vit_timing_buf is None:
-        _vit_timing_buf = mmap.mmap(-1, 8)   # 8 bytes = one float64
-        struct.pack_into("d", _vit_timing_buf, 0, _VIT_TIMING_SENTINEL)
-    return _vit_timing_buf
+def setup_timing_shm():
+    """Create the socket pair for timing IPC (call once, BEFORE LLM())."""
+    global _timing_socks
+    if _timing_socks is None:
+        recv_s, send_s = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        recv_s.setblocking(False)   # parent: non-blocking read
+        _timing_socks = (recv_s, send_s)
+    return _timing_socks
 
 # ---------------------------------------------------------------------------
 # CUDA event timing hook (used by runtime_analysis, independent of sparse ViT)
@@ -151,12 +161,16 @@ def get_vit_ms() -> Optional[float]:
     ms = getattr(_vit_timing, "ms", None)
     if ms is not None:
         return ms
-    # Subprocess path: mmap written by import hook inside EngineCore subprocess.
-    # Both parent and child map the same physical page (MAP_ANONYMOUS|MAP_SHARED).
-    if _vit_timing_buf is not None:
-        v = struct.unpack_from("d", _vit_timing_buf, 0)[0]
-        if v != _VIT_TIMING_SENTINEL:
-            return v
+    # Subprocess path: read from socket pair written by _hook_forward in child.
+    if _timing_socks is not None:
+        try:
+            data = _timing_socks[0].recv(8)
+            if len(data) == 8:
+                return struct.unpack("d", data)[0]
+        except BlockingIOError:
+            pass   # nothing written yet — child did not send timing
+        except Exception:
+            pass
     return None
 
 
@@ -594,7 +608,6 @@ def install_import_hook() -> None:
 
                 def _hook_forward(self_enc, *args, **kwargs):
                     import torch as _torch
-                    import sys as _sys
                     start = _torch.cuda.Event(enable_timing=True)
                     end = _torch.cuda.Event(enable_timing=True)
                     start.record()
@@ -611,16 +624,15 @@ def install_import_hook() -> None:
                     ms = start.elapsed_time(end)
                     _vit_timing.ms = ms
 
-                    # Print to stdout — the EngineCore subprocess inherits the
-                    # Docker container's stdout, so runtime_analysis.py sees
-                    # this line in the captured Docker output and can parse it.
-                    # This sidesteps all cross-process shared-memory issues.
-                    print(f"VIT_TIMING_MS:{ms:.3f}", flush=True, file=_sys.stdout)
-
-                    # Also attempt mmap write as belt-and-suspenders.
-                    if _vit_timing_buf is not None:
+                    # Send timing via socket pair — the send socket is
+                    # inherited across fork, bypasses stdout redirection
+                    # and filesystem namespace isolation.
+                    if _timing_socks is not None:
                         import struct as _struct
-                        _struct.pack_into("d", _vit_timing_buf, 0, ms)
+                        try:
+                            _timing_socks[1].send(_struct.pack("d", ms))
+                        except Exception:
+                            pass
                     return result
 
                 cls.forward = _hook_forward

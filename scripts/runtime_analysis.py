@@ -150,8 +150,7 @@ def _ms(val) -> str:
     return f"{val:,.0f}" if val is not None else "n/a"
 
 
-def print_report(results: list[dict], pruning_rate: float, reps: int,
-                 vit_bench: dict | None = None) -> None:
+def print_report(results: list[dict], pruning_rate: float, reps: int) -> None:
     W = 90
     print("\n" + "=" * W)
     print("END-TO-END RUNTIME ANALYSIS  —  AutoGaze × vLLM")
@@ -279,26 +278,6 @@ def print_report(results: list[dict], pruning_rate: float, reps: int,
             print(f"    [{label}]  elapsed={_ms(rep.get('elapsed_ms'))} ms{vit_s}{lm_s}  "
                   f"tokens={rep.get('num_prompt_tokens','?')}  answer={rep.get('answer','?')}")
 
-    # ── Standalone ViT bench results ──────────────────────────────────────────
-    if vit_bench:
-        b = vit_bench
-        print()
-        print("STANDALONE ViT BENCH  (direct CUDA events — no vLLM subprocess)")
-        print(f"  N={b['N']} ({b['n_frames']}×{b['h_patches']}×{b['w_patches']} patches)  "
-              f"K={b['K']}  K/N={b['K_over_N']:.3f}")
-        print(f"  Dense  ViT: {b['dense']['median']:.0f} ms  "
-              f"[{b['dense']['min']:.0f}–{b['dense']['max']:.0f}]")
-        print(f"  Sparse ViT: {b['sparse']['median']:.0f} ms  "
-              f"[{b['sparse']['min']:.0f}–{b['sparse']['max']:.0f}]")
-        print(f"  Measured ViT speedup:        {b['speedup']:.2f}×")
-        print(f"  Theoretical attn (N/K)²:     {b['attn_theory']:.1f}×")
-        print(f"  Theoretical FFN  (N/K):      {b['ffn_theory']:.1f}×")
-        print()
-        print("  Context: sparse_vit end-to-end appears slower than dense because")
-        print("  enforce_eager=True (~1.6 s overhead) + AutoGaze preprocessing (~0.5 s)")
-        print("  exceed the ViT savings at this video scale.  Compare sparse_vit vs EVS")
-        print("  (both have enforce_eager): sparse_vit saves the ViT cost shown above.")
-
     print()
     print(f"Results saved to: {RESULTS_FILE}")
     print("=" * W)
@@ -370,64 +349,11 @@ def main():
                 "reps": [],
             })
 
-    # ── Standalone ViT bench (no vLLM subprocess — direct CUDA event timing) ─
-    sv = next((r for r in results if r["mode"] == "sparse_vit"), None)
-    dense_r = next((r for r in results if r["mode"] == "dense"), None)
-    vit_bench = None
-    if sv and sv.get("K_vit") and dense_r and dense_r.get("num_prompt_tokens", 0) > 0:
-        k_vit    = sv["K_vit"]
-        n_visual = dense_r["num_prompt_tokens"] - 82   # ~82 text tokens
-        n_vit    = n_visual * 4                         # 2×2 merger: each visual token = 4 ViT patches
-        n_frames = max(1, n_vit // (28 * 28))           # 28×28 patches per frame
-        print(f"\n--- Standalone ViT bench: K={k_vit}, N≈{n_vit} ({n_frames} frames) ---")
-        try:
-            vit_bench = run_vit_bench(k_vit=k_vit, n_frames=n_frames)
-        except Exception as e:
-            print(f"  ViT bench failed: {e}")
-
     # ── Report ────────────────────────────────────────────────────────────────
-    print_report(results, pruning_rate, reps, vit_bench=vit_bench)
+    print_report(results, pruning_rate, reps)
 
     with open(RESULTS_FILE, "w") as f:
         json.dump(results, f, indent=2)
-
-
-def run_vit_bench(k_vit: int, n_frames: int,
-                  model: str = "Qwen/Qwen3-VL-2B-Instruct",
-                  reps: int = 5, warmup: int = 2) -> dict | None:
-    """
-    Run bench_vit_timing.py inside a Docker container.
-    Returns the parsed VIT_BENCH_JSON dict, or None on failure.
-    """
-    env_vars = [
-        "-e", f"REPO_DIR=/workspace/AutoGaze",
-        "-e", f"HF_HOME=/root/.cache/huggingface",
-        "-e", "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
-    ]
-    vol_mounts = [
-        "-v", f"{HF_CACHE}:/root/.cache/huggingface",
-        "-v", f"{REPO_DIR}:/workspace/AutoGaze",
-    ]
-    cmd = [
-        "docker", "run", "--rm",
-        "--gpus", "all", "--shm-size", "16g",
-        *vol_mounts, *env_vars,
-        VLLM_IMAGE,
-        "python3", "/workspace/AutoGaze/scripts/bench_vit_timing.py",
-        "--model", model,
-        "--k-vit", str(k_vit),
-        "--n-frames", str(n_frames),
-        "--reps", str(reps),
-        "--warmup", str(warmup),
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    full = proc.stdout + "\n" + proc.stderr
-    for line in full.splitlines():
-        if "VIT_BENCH_JSON" not in line:
-            print(f"  {line}")
-        if line.startswith("VIT_BENCH_JSON:"):
-            return json.loads(line[len("VIT_BENCH_JSON:"):])
-    return None
 
 
 if __name__ == "__main__":
