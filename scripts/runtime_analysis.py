@@ -218,35 +218,47 @@ def print_report(results: list[dict], pruning_rate: float, reps: int) -> None:
     dense_cold_vit= dense.get("vit_ms")        if dense else None
 
     # ── COLD table (rep 0: fresh model load, no GPU warmup) ──────────────────
+    any_preprocess = any(r.get("preprocess_ms") for r in results)
     print("COLD INFERENCE  (rep 0 — fresh container, no warmup, no encoder cache)")
+    if any_preprocess:
+        print("  AutoGaze (ms) = preprocessing outside Docker (included in E2E total)")
     cols = [
-        ("Mode",        "<13"),
-        ("Tokens",      ">7"),
-        ("vs Dense",    ">9"),
-        ("Load (ms)",   ">10"),
-        ("ViT (ms)",    ">10"),
-        ("LM (ms)",     ">9"),
-        ("Total (ms)",  ">11"),
-        ("Answer",      ">7"),
+        ("Mode",           "<13"),
+        ("Tokens",         ">7"),
+        ("vs Dense",       ">9"),
+        ("Load (ms)",      ">10"),
+        ("AutoGaze (ms)",  ">14") if any_preprocess else ("", ">0"),
+        ("ViT (ms)",       ">10"),
+        ("LM (ms)",        ">9"),
+        ("Infer (ms)",     ">11"),
+        ("E2E (ms)",       ">10") if any_preprocess else ("", ">0"),
+        ("Answer",         ">7"),
     ]
+    cols = [(h, f) for h, f in cols if h]  # drop zero-width placeholders
     hdr = "  ".join(f"{h:{f}}" for h, f in cols)
     sep = "  ".join("-" * int(f.lstrip("<>^")) for _, f in cols)
     print(hdr)
     print(sep)
 
     for r in results:
-        tok   = r.get("num_prompt_tokens", -1)
-        vit   = r.get("vit_ms")
-        lm    = r.get("lm_ms")
-        total = r.get("elapsed_ms")
-        load  = r.get("load_ms")
-        vs    = (f"-{(1 - tok/dense_tok)*100:.0f}%"
-                 if dense_tok and tok > 0 and r["mode"] != "dense" else "—")
-        print(
-            f"  {r['mode']:<13}  {tok:>7}  {vs:>9}  "
-            f"{_ms(load):>10}  {_ms(vit):>10}  "
-            f"{_ms(lm):>9}  {_ms(total):>11}  {r.get('answer','?'):>7}"
-        )
+        tok      = r.get("num_prompt_tokens", -1)
+        vit      = r.get("vit_ms")
+        lm       = r.get("lm_ms")
+        infer    = r.get("elapsed_ms")
+        load     = r.get("load_ms")
+        preproc  = r.get("preprocess_ms")
+        e2e      = (infer + preproc) if (infer and preproc) else infer
+        vs       = (f"-{(1 - tok/dense_tok)*100:.0f}%"
+                    if dense_tok and tok > 0 and r["mode"] != "dense" else "—")
+        row = (f"  {r['mode']:<13}  {tok:>7}  {vs:>9}  "
+               f"{_ms(load):>10}  ")
+        if any_preprocess:
+            row += f"{_ms(preproc):>14}  "
+        row += f"{_ms(vit):>10}  {_ms(lm):>9}  {_ms(infer):>11}"
+        if any_preprocess:
+            row += f"  {_ms(e2e):>10}"
+        row += f"  {r.get('answer','?'):>7}"
+        print(row)
 
     # ── WARM table (avg reps 1+: GPU warm, but vLLM encoder cache active) ────
     warm_available = any(r.get("avg_elapsed_ms") for r in results
@@ -273,16 +285,37 @@ def print_report(results: list[dict], pruning_rate: float, reps: int) -> None:
     # ── Speedup summary ───────────────────────────────────────────────────────
     print()
     if dense_cold_ms:
-        print("Speedup over dense  (cold inference, rep 0):")
+        print("Speedup over dense  (cold, rep 0; E2E includes AutoGaze preprocessing):")
         for r in results:
             if r["mode"] == "dense":
                 continue
-            inf = r.get("elapsed_ms")
-            if inf:
-                speedup = dense_cold_ms / inf
+            inf     = r.get("elapsed_ms")
+            preproc = r.get("preprocess_ms")
+            e2e     = (inf + preproc) if (inf and preproc) else inf
+            if e2e:
+                speedup = dense_cold_ms / e2e
                 sign = "×" if speedup >= 1 else "× (slower)"
-                print(f"  {r['mode']:<13}  {speedup:.2f}{sign}  "
-                      f"({_ms(inf)} ms vs {_ms(dense_cold_ms)} ms)")
+                detail = f"{_ms(e2e)} ms"
+                if preproc:
+                    detail += f" ({_ms(inf)} infer + {_ms(preproc)} AutoGaze)"
+                print(f"  {r['mode']:<13}  {speedup:.2f}{sign}  ({detail} vs {_ms(dense_cold_ms)} ms)")
+
+    # EVS vs sparse_vit (both have enforce_eager, fair ViT/LM comparison)
+    evs_r = next((r for r in results if r["mode"] == "evs"), None)
+    sv_r  = next((r for r in results if r["mode"] == "sparse_vit"), None)
+    if evs_r and sv_r:
+        evs_e2e = evs_r.get("elapsed_ms")
+        sv_inf  = sv_r.get("elapsed_ms")
+        sv_prep = sv_r.get("preprocess_ms")
+        sv_e2e  = (sv_inf + sv_prep) if (sv_inf and sv_prep) else sv_inf
+        if evs_e2e and sv_e2e:
+            print()
+            speedup = evs_e2e / sv_e2e
+            sign = "×" if speedup >= 1 else "× (slower)"
+            detail = f"{_ms(sv_e2e)} ms"
+            if sv_prep:
+                detail += f" ({_ms(sv_inf)} infer + {_ms(sv_prep)} AutoGaze)"
+            print(f"sparse_vit vs evs   {speedup:.2f}{sign}  ({detail} vs {_ms(evs_e2e)} ms)")
 
     evs = next((r for r in results if r["mode"] == "evs"), None)
     evs_vit = evs.get("vit_ms") if evs else None
