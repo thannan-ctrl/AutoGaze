@@ -42,16 +42,16 @@ Three hooks monkey-patched in vLLM: `Qwen2_5VLVisionTransformer.forward` (gather
 ## Key findings
 
 **1. Inference speedup is real (−6.9% vs dense\_eager).**  
-The CPU-external row isolates pure inference: sparse_vit Docker time (12,661 ms) beats dense_eager (13,604 ms) by **943 ms**. Token reduction: 924 vs 6,403 (−86%). Both ViT compute and LM decode benefit.
+The CPU-external row measures pure vLLM inference time, with AutoGaze preprocessing counted separately. sparse_vit Docker time (12,661 ms) beats dense_eager (13,604 ms) by **943 ms (−6.9%)**. Token reduction: 924 vs 6,403 (−86%). Both ViT compute and LM decode are cheaper.
 
-**2. GPU AutoGaze brings E2E to near break-even (+1.7%).**  
-With AutoGaze running on the GB200 inside Docker, preprocessing overhead is ~1–2 s (bundled into Infer). The ViT+LM savings (~943 ms) nearly cancel it. The 1.7% gap is within run-to-run noise.
+**2. AutoGaze was accidentally running on CPU — that was the bottleneck.**  
+The external miniforge-aarch64 env has no CUDA → 19,267 ms preprocessing → E2E 2.3× slower than dense_eager. This is a deployment bug, not an algorithmic one.
 
-**3. AutoGaze was accidentally running on CPU.**  
-The external miniforge-aarch64 Python env has no CUDA → 19,267 ms → E2E 2.3× slower than dense_eager. On GPU this drops to ~1–2 s. **This was a deployment bug, not a fundamental problem.**
+**3. GPU AutoGaze brings E2E to near break-even (+1.7%).**  
+With AutoGaze on the GB200 inside Docker, preprocessing is ~1.2 s. The inference savings (943 ms) partially offset this overhead, leaving sparse_vit only **234 ms (+1.7%) slower** than dense_eager end-to-end — within run-to-run noise at this scale.
 
-**4. `enforce_eager` adds ~156 ms — and sparse_vit still wins.**  
-EVS and sparse_vit require `enforce_eager=True` to activate pruning hooks, disabling CUDA graphs. Dense without eager: 13,448 ms; dense\_eager: 13,604 ms (+156 ms). Even so, sparse_vit inference-only (12,661 ms) beats plain dense (13,448 ms) by **5.9%**.
+**4. `enforce_eager` overhead is 156 ms — sparse_vit still beats unconstrained dense.**  
+EVS and sparse_vit require `enforce_eager=True` to activate pruning hooks, disabling CUDA graphs. This adds 156 ms vs plain dense (13,448 ms → 13,604 ms dense_eager). Even so, sparse_vit pure inference time (12,661 ms) is **5.9% faster than plain dense** — the sparse ViT + token savings outweigh both the eager-mode penalty and the CUDA-graph advantage dense gets for free.
 
 ---
 
@@ -59,7 +59,6 @@ EVS and sparse_vit require `enforce_eager=True` to activate pruning hooks, disab
 
 - **ViT timing not captured.** CUDA events inside vLLM's EngineCore subprocess cannot be read from the parent process — all IPC mechanisms tried (file, mmap, shared memory, socket pair, stdout) failed. The theoretical (N/K)² ≈ 62× attention speedup and the original 4.56× measured ViT speedup cannot be re-confirmed with this vLLM version.
 
-- **Original results required a different image.** The reference (sparse_vit 14,188 ms vs dense 17,348 ms, −18%) was on an internal NVIDIA image with vLLM's V0 single-process executor, where the ViT ran in-process and timing worked. The current public image (V1, EngineCore subprocess) absorbs ViT savings inside the rendering phase, making end-to-end comparison noisier.
 
 ---
 
