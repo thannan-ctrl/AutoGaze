@@ -247,8 +247,16 @@ def print_report(results: list[dict], pruning_rate: float, reps: int) -> None:
                     print(f"  sparse_vit ViT: {_ms(svit)} ms")
                     print(f"  sparse_vit vs EVS ViT speedup: {evs_vit/svit:.2f}×  "
                           f"({_ms(svit)} ms vs {_ms(evs_vit)} ms)")
-                    print(f"  (K/N)² theoretical: "
-                          f"{(r.get('K_vit',0) or 0) and f\"{(r['K_vit']/max(r.get('K_vit',1),1))**2:.2f}×\" or 'n/a'}")
+                    k_vit = r.get("K_vit") or 0
+                    # N_vit: infer from dense token count (visual tokens * 4 ViT patches each)
+                    dense_vis = ((dense_tok or 0) - 82) if dense_tok else 0  # ~82 text tokens
+                    n_vit = dense_vis * 4
+                    if k_vit and n_vit:
+                        ratio = k_vit / n_vit
+                        attn_speedup = (n_vit / k_vit) ** 2
+                        ffn_speedup  = n_vit / k_vit
+                        print(f"  K/N = {ratio:.3f}  →  attn speedup (N/K)²={attn_speedup:.1f}×  "
+                              f"FFN speedup (N/K)={ffn_speedup:.1f}×")
 
     elif not (dense_cold_vit or evs_vit):
         print()
