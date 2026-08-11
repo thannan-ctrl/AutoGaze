@@ -197,7 +197,8 @@ def main():
     # subprocess to record CUDA timing and write it to _TIMING_IPC_PATH.
     # For sparse_vit it also applies the gather op; for evs it only times.
     if mode in ("sparse_vit", "evs"):
-        from autogaze.vllm_integration.sparse_vit import install_import_hook
+        from autogaze.vllm_integration.sparse_vit import install_import_hook, setup_timing_shm
+        setup_timing_shm()   # must be before fork (i.e., before LLM())
         install_import_hook()
 
     from vllm import LLM, SamplingParams
@@ -331,7 +332,10 @@ def main():
         # All reps for post-processing
         "reps": rep_results,
     }
-    print("RESULT_JSON:" + json.dumps(result))
+    print("RESULT_JSON:" + json.dumps(result), flush=True)
+    # Bypass PyTorch/weakref atexit cleanup (known crash on Python 3.12 in
+    # Docker with torch._ops namespace teardown). All output is already flushed.
+    import os as _os; _os._exit(0)
 
 
 if __name__ == "__main__":

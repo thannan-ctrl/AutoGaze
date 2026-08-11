@@ -62,8 +62,10 @@ Usage:
 """
 from __future__ import annotations
 
+import ctypes
 import os
 import threading
+from multiprocessing import Value
 from typing import Optional, Tuple
 
 import torch
@@ -78,10 +80,19 @@ _PATCHED_ENCODERS: dict = {}   # id(encoder) → original_forward
 # (inside the same Docker container) lets _sparse_vit_forward read it.
 _IPC_PATH = os.environ.get("SPARSE_VIT_IPC_PATH", "/tmp/_autogaze_sparse_vit_ctx.pt")
 
-# File used for cross-process ViT timing communication.
-# The import hook records CUDA timing inside the EngineCore subprocess and
-# writes it here; the main process reads it via get_vit_ms().
-_TIMING_IPC_PATH = os.environ.get("SPARSE_VIT_TIMING_IPC_PATH", "/tmp/_autogaze_vit_timing.json")
+# Shared-memory slot for cross-process ViT timing.
+# Must be created BEFORE fork (i.e., before LLM()) so both parent and child
+# map the same physical memory page.  -1.0 = not yet written.
+# Call setup_timing_shm() once before install_import_hook().
+_vit_timing_shm: Optional[Value] = None
+
+
+def setup_timing_shm() -> Value:
+    """Create the shared-memory timing slot (call once, before LLM())."""
+    global _vit_timing_shm
+    if _vit_timing_shm is None:
+        _vit_timing_shm = Value(ctypes.c_double, -1.0)
+    return _vit_timing_shm
 
 # ---------------------------------------------------------------------------
 # CUDA event timing hook (used by runtime_analysis, independent of sparse ViT)
@@ -136,13 +147,13 @@ def get_vit_ms() -> Optional[float]:
     ms = getattr(_vit_timing, "ms", None)
     if ms is not None:
         return ms
-    # Subprocess path: read from file written by import hook inside EngineCore
-    if os.path.exists(_TIMING_IPC_PATH):
-        try:
-            import json as _json
-            return _json.load(open(_TIMING_IPC_PATH)).get("vit_ms")
-        except Exception:
-            pass
+    # Subprocess path: shared memory written by import hook inside EngineCore.
+    # Works because _vit_timing_shm is created before fork and both parent and
+    # child map the same physical page.
+    if _vit_timing_shm is not None:
+        v = _vit_timing_shm.value
+        if v >= 0.0:
+            return v
     return None
 
 
@@ -580,7 +591,6 @@ def install_import_hook() -> None:
 
                 def _hook_forward(self_enc, *args, **kwargs):
                     import torch as _torch
-                    import json as _json
                     start = _torch.cuda.Event(enable_timing=True)
                     end = _torch.cuda.Event(enable_timing=True)
                     start.record()
@@ -596,11 +606,11 @@ def install_import_hook() -> None:
                     _torch.cuda.synchronize()
                     ms = start.elapsed_time(end)
                     _vit_timing.ms = ms
-                    try:
-                        with open(_TIMING_IPC_PATH, "w") as _f:
-                            _json.dump({"vit_ms": ms}, _f)
-                    except Exception as _e:
-                        print(f"[SparseViT] Warning: could not write timing IPC: {_e}", flush=True)
+                    # Write to shared memory so main process can read it.
+                    # _vit_timing_shm is created before fork, so both parent
+                    # and child map the same physical page — no file I/O needed.
+                    if _vit_timing_shm is not None:
+                        _vit_timing_shm.value = ms
                     return result
 
                 cls.forward = _hook_forward
