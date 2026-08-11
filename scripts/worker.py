@@ -192,7 +192,11 @@ def main():
     # forks the EngineCore subprocess, the child inherits sys.meta_path and
     # the hook fires when the child imports qwen3_vl — patching the class
     # before it is instantiated, without any cross-process class patching.
-    if mode == "sparse_vit":
+    # Install import hook for any mode that needs ViT timing.
+    # The hook patches Qwen2_5VLVisionTransformer.forward in the EngineCore
+    # subprocess to record CUDA timing and write it to _TIMING_IPC_PATH.
+    # For sparse_vit it also applies the gather op; for evs it only times.
+    if mode in ("sparse_vit", "evs"):
         from autogaze.vllm_integration.sparse_vit import install_import_hook
         install_import_hook()
 

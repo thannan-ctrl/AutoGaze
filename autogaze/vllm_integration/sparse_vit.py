@@ -78,6 +78,11 @@ _PATCHED_ENCODERS: dict = {}   # id(encoder) → original_forward
 # (inside the same Docker container) lets _sparse_vit_forward read it.
 _IPC_PATH = os.environ.get("SPARSE_VIT_IPC_PATH", "/tmp/_autogaze_sparse_vit_ctx.pt")
 
+# File used for cross-process ViT timing communication.
+# The import hook records CUDA timing inside the EngineCore subprocess and
+# writes it here; the main process reads it via get_vit_ms().
+_TIMING_IPC_PATH = os.environ.get("SPARSE_VIT_TIMING_IPC_PATH", "/tmp/_autogaze_vit_timing.json")
+
 # ---------------------------------------------------------------------------
 # CUDA event timing hook (used by runtime_analysis, independent of sparse ViT)
 # ---------------------------------------------------------------------------
@@ -127,7 +132,18 @@ def patch_vit_timing(llm) -> Optional[object]:
 
 def get_vit_ms() -> Optional[float]:
     """Return the ViT forward time (ms) from the last inference, or None."""
-    return getattr(_vit_timing, "ms", None)
+    # Fast path: thread-local (works when ViT runs in-process)
+    ms = getattr(_vit_timing, "ms", None)
+    if ms is not None:
+        return ms
+    # Subprocess path: read from file written by import hook inside EngineCore
+    if os.path.exists(_TIMING_IPC_PATH):
+        try:
+            import json as _json
+            return _json.load(open(_TIMING_IPC_PATH)).get("vit_ms")
+        except Exception:
+            pass
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -563,11 +579,29 @@ def install_import_hook() -> None:
                 _PATCHED_ENCODERS[id(cls)] = original_forward
 
                 def _hook_forward(self_enc, *args, **kwargs):
+                    import torch as _torch
+                    import json as _json
+                    start = _torch.cuda.Event(enable_timing=True)
+                    end = _torch.cuda.Event(enable_timing=True)
+                    start.record()
+
                     payload = get_sparse_payload()
                     if payload is None:
-                        return original_forward(self_enc, *args, **kwargs)
-                    bound = original_forward.__get__(self_enc, type(self_enc))
-                    return _sparse_vit_forward(self_enc, bound, payload, *args, **kwargs)
+                        result = original_forward(self_enc, *args, **kwargs)
+                    else:
+                        bound = original_forward.__get__(self_enc, type(self_enc))
+                        result = _sparse_vit_forward(self_enc, bound, payload, *args, **kwargs)
+
+                    end.record()
+                    _torch.cuda.synchronize()
+                    ms = start.elapsed_time(end)
+                    _vit_timing.ms = ms
+                    try:
+                        with open(_TIMING_IPC_PATH, "w") as _f:
+                            _json.dump({"vit_ms": ms}, _f)
+                    except Exception as _e:
+                        print(f"[SparseViT] Warning: could not write timing IPC: {_e}", flush=True)
+                    return result
 
                 cls.forward = _hook_forward
                 print(
