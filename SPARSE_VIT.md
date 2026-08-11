@@ -43,32 +43,47 @@ Video (T frames)
 ## Results (2026-08-11)
 
 **Model:** `Qwen/Qwen3-VL-2B-Instruct` · **Video:** `assets/long_test_video.mp4` (31 s, 32 frames sampled)  
-**GPU:** GB200 (gb-nvl-081-compute03) · **Image:** `nvcr.io/nvidia/vllm:26.07-py3`  
-**Command:** `--modes dense evs sparse_vit --gazing-ratio 0.245 --pruning-rate 0.5 --reps 1`
+**GPU:** GB200 (gb-nvl-081-compute03) · **Image:** `nvcr.io/nvidia/vllm:26.07-py3`
 
-| Mode | Tokens | vs Dense | Infer (ms) | ViT (ms) | LM (ms) | Answer |
-|---|---:|:---:|---:|:---:|:---:|:---:|
-| dense | 6,403 | — | 13,448 | — | — | C |
-| evs (q=0.5) | 3,365 | −47% | 13,284 | — | — | C |
-| **sparse\_vit (ratio=0.245)** | **878** | **−86%** | **13,866** | **—** | **—** | **C** |
+All modes answer correctly (**C**). Token compression works: AutoGaze selected ~924 of 6,403 visual tokens (14.4%).
 
-All modes answer correctly. Token compression works as expected: AutoGaze selected ~878 of 6,403 tokens (13.7%), reducing LM input by 86%.
+### Inference-only comparison (all modes with `enforce_eager=True`)
+
+`dense_eager` is the correct baseline — same execution mode as EVS and sparse_vit (no CUDA graphs).
+
+| Mode | Tokens | Infer (ms) | vs dense\_eager | AutoGaze preproc (ms) | E2E (ms) |
+|---|---:|---:|:---:|---:|---:|
+| dense\_eager | 6,403 | 13,777 | — | — | 13,777 |
+| evs | 3,365 | 13,532 | −1.8% | — | 13,532 |
+| **sparse\_vit** | **924** | **12,661** | **−8.1%** | **19,267** | **31,928** |
+
+**sparse_vit is 8.1% faster than dense_eager and 6.4% faster than EVS in inference time.**  
+The 924 token LM input (vs 6,403 dense) reduced both ViT compute and decode time.
+
+### Why E2E is still slower: AutoGaze preprocessing
+
+The AutoGaze mask computation (ShallowVideoConvNet + LLaMA decoder on 32 frames) takes **19,267 ms** — more than the **1,116 ms** saved in inference. End-to-end, sparse_vit costs 31,928 ms vs 13,777 ms for dense_eager.
+
+### CUDA graphs vs eager mode (why dense < dense_eager)
+
+| Mode | enforce_eager | Infer (ms) | Notes |
+|---|:---:|---:|---|
+| dense | ✗ | 13,448 | CUDA graphs active — fastest baseline |
+| dense\_eager | ✓ | 13,777 | +329 ms graph-compilation overhead |
+| evs | ✓ | 13,532 | enforce\_eager required for pruning hooks |
+| sparse\_vit | ✓ | 12,661 | enforce\_eager + sparse selection |
+
+Comparing sparse_vit (12,661 ms) to **dense** (13,448 ms, no enforce_eager): **sparse_vit is still 5.9% faster**, even with the graph-compilation overhead it must pay and dense does not.
 
 ---
 
 ## Shortcomings
 
-### 1. sparse_vit is slower than dense end-to-end
+### 1. AutoGaze preprocessing dominates E2E time
 
-Despite 86% fewer tokens, sparse_vit (13,866 ms) is **3% slower** than dense (13,448 ms). This has three causes:
+The inference speedup is confirmed (**8.1% faster** than dense_eager, **6.4% faster** than EVS), but the AutoGaze mask computation (19,267 ms on 32 frames) makes E2E wall time 2.3× worse than not using AutoGaze at all.
 
-**a) Rendering dominates (~12–13 s, same for all modes).** vLLM's internal "Rendering conversations" phase — video decode, frame preprocessing, and ViT encoding — takes ~12–13 s regardless of pruning mode. The ViT savings from K=878 vs N=6,403 patches are real but occur inside this 12–13 s block, making them invisible in total wall time.
-
-**b) `enforce_eager=True` overhead (~600 ms).** EVS and sparse_vit require `enforce_eager=True` to activate the pruning hooks. This disables CUDA graphs, adding ~600 ms for non-dense modes.
-
-**c) AutoGaze preprocessing on 32 frames (~1–2 s).** AutoGaze runs the ShallowVideoConvNet + LLaMA-4L decoder on all 32 frames before vLLM starts. This overhead grows with frame count.
-
-Net: AutoGaze overhead + enforce_eager overhead ≈ 1.5–2.5 s; ViT+LM savings ≈ 0.5–1 s → sparse_vit appears slower.
+The preprocessing runs ShallowVideoConvNet + LLaMA-4L autoregressively on all frames. It needs to be accelerated (batching, early-exit tuning, or hardware-optimized inference) for the E2E speedup to be net positive.
 
 ### 2. ViT and LM timing not captured
 
