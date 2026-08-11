@@ -28,18 +28,62 @@ REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HF_CACHE = os.environ.get("HF_HOME", "/home/scratch.thannan_wwfo/hf_cache")
 RESULTS_FILE = os.path.join(REPO_DIR, "runtime_analysis.json")
 
-VLLM_IMAGE = "nvcr.io/nvidia/vllm:26.07-py3"
+# Current public image — vLLM V1 engine (EngineCore subprocess, rendering dominates)
+VLLM_IMAGE_CURRENT = "nvcr.io/nvidia/vllm:26.07-py3"
+
+# Original internal image — vLLM V0 engine (ViT in-process, sparse ViT speedup visible)
+# Requires NVIDIA internal registry access.
+VLLM_IMAGE_ORIGINAL = "gitlab-master.nvidia.com:5005/dl/dgx/vllm:main-py3.60784172-devel-arm64"
+
+VLLM_IMAGE = VLLM_IMAGE_CURRENT   # default; override with --image
+
+# Python interpreter for AutoGaze preprocessing (outside Docker, original two-env flow).
+# Used when --external-autogaze is set.
+AUTOGAZE_PYTHON = "/home/scratch.thannan_wwfo/miniforge-aarch64/envs/auto_gaze/bin/python"
+MASK_PATH_VIT   = "/tmp/ag_mask_vit_runtime.pt"
+
+
+def run_autogaze_preprocess(video_path: str, gazing_ratio: float,
+                            grid_h: int = 28, grid_w: int = 28) -> float:
+    """
+    Run AutoGaze preprocessing OUTSIDE Docker using the auto_gaze conda env.
+    Saves mask to MASK_PATH_VIT. Returns wall time in ms.
+    """
+    cmd = [
+        AUTOGAZE_PYTHON,
+        os.path.join(REPO_DIR, "scripts", "run_autogaze_preprocess.py"),
+        "--video", video_path,
+        "--output", MASK_PATH_VIT,
+        "--gazing-ratio", str(gazing_ratio),
+        "--grid-hw", str(grid_h), str(grid_w),
+    ]
+    print(f"\n[autogaze_preprocess] video={video_path} ratio={gazing_ratio} "
+          f"grid={grid_h}×{grid_w} → {MASK_PATH_VIT}", flush=True)
+    t0 = time.perf_counter()
+    result = subprocess.run(cmd, capture_output=False, text=True)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    if result.returncode != 0:
+        raise RuntimeError(f"AutoGaze preprocessing failed (exit {result.returncode})")
+    print(f"[autogaze_preprocess] Done in {elapsed_ms:.0f} ms", flush=True)
+    return elapsed_ms
 
 
 def run_docker(mode: str, pruning_rate: float, reps: int,
                gazing_ratio: float = 0.245,
                max_frames: int = 32, fps: float = 2.0,
-               video_path: str | None = None) -> dict:
+               video_path: str | None = None,
+               external_autogaze: bool = False) -> dict:
     """
     Run one mode in a Docker container.
     Returns the parsed RESULT_JSON dict augmented with wall_ms.
+
+    external_autogaze=True: original two-env flow — AutoGaze mask was pre-computed
+    outside Docker by run_autogaze_preprocess(); pass it via --mask to worker.py.
+    Works with the original vLLM V0 image where ViT runs in-process.
+
+    external_autogaze=False (default): single-env flow — AutoGaze runs inline
+    inside Docker via --video argument.  Works with the current V1 image.
     """
-    # Resolve video path: default to example_input.mp4, allow override
     docker_video = video_path or "/workspace/AutoGaze/assets/example_input.mp4"
 
     env_vars = [
@@ -62,10 +106,14 @@ def run_docker(mode: str, pruning_rate: float, reps: int,
     ]
 
     if mode == "sparse_vit":
-        worker_args += [
-            "--video", docker_video,
-            "--gazing-ratio", str(gazing_ratio),
-        ]
+        if external_autogaze and os.path.exists(MASK_PATH_VIT):
+            # Original flow: pass pre-computed mask; Docker reads it from host path
+            vol_mounts += ["-v", f"{MASK_PATH_VIT}:{MASK_PATH_VIT}"]
+            env_vars   += ["-e", f"AUTOGAZE_MASK_PATH={MASK_PATH_VIT}"]
+            worker_args += ["--mask", MASK_PATH_VIT]
+        else:
+            # Current flow: AutoGaze runs inline inside Docker
+            worker_args += ["--video", docker_video, "--gazing-ratio", str(gazing_ratio)]
 
     cmd = [
         "docker", "run", "--rm",
@@ -284,6 +332,7 @@ def print_report(results: list[dict], pruning_rate: float, reps: int) -> None:
 
 
 def main():
+    global VLLM_IMAGE
     parser = argparse.ArgumentParser()
     parser.add_argument("--reps", type=int, default=3,
                         help="Inference reps per mode (first=warmup)")
@@ -299,17 +348,45 @@ def main():
                         help="Frame sampling rate")
     parser.add_argument("--video", default=None,
                         help="Docker-side video path (default: assets/example_input.mp4)")
+    parser.add_argument("--image", default=None,
+                        help=f"Docker image override. "
+                             f"'original' = {VLLM_IMAGE_ORIGINAL}  "
+                             f"'current' = {VLLM_IMAGE_CURRENT}")
+    parser.add_argument("--external-autogaze", action="store_true",
+                        help="Run AutoGaze preprocessing outside Docker in the auto_gaze "
+                             "conda env (original two-env flow, required for original image)")
     args = parser.parse_args()
+
+    # Apply image override
+    if args.image == "original":
+        VLLM_IMAGE = VLLM_IMAGE_ORIGINAL
+    elif args.image == "current" or args.image is None:
+        VLLM_IMAGE = VLLM_IMAGE_CURRENT
+    else:
+        VLLM_IMAGE = args.image
 
     pruning_rate = args.pruning_rate
     reps = args.reps
     modes = args.modes
+    external_autogaze = args.external_autogaze
 
     print("=" * 70)
     print("Runtime Analysis — dense vs EVS vs sparse_vit")
     print("=" * 70)
     print(f"Modes: {modes}  |  pruning_rate={pruning_rate}  |  reps={reps}")
-    print(f"Image: {VLLM_IMAGE}\n")
+    print(f"Image: {VLLM_IMAGE}")
+    if external_autogaze:
+        print(f"AutoGaze: external ({AUTOGAZE_PYTHON})")
+    print()
+
+    # ── Pre-compute AutoGaze mask outside Docker (original two-env flow) ──────
+    preprocess_ms = None
+    if external_autogaze and "sparse_vit" in modes:
+        host_video = os.path.join(REPO_DIR, "assets", "example_input.mp4")
+        preprocess_ms = run_autogaze_preprocess(
+            video_path=host_video,
+            gazing_ratio=args.gazing_ratio,
+        )
 
     # ── Run each mode in Docker ───────────────────────────────────────────────
     results = []
@@ -326,7 +403,10 @@ def main():
                 max_frames=args.max_frames,
                 fps=args.fps,
                 video_path=args.video,
+                external_autogaze=external_autogaze,
             )
+            if mode == "sparse_vit" and preprocess_ms:
+                r["preprocess_ms"] = preprocess_ms
             results.append(r)
             tok  = r.get("num_prompt_tokens", "?")
             inf  = r.get("avg_elapsed_ms") or r.get("elapsed_ms", "?")
