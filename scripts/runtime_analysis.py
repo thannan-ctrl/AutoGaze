@@ -91,9 +91,6 @@ def run_docker(mode: str, pruning_rate: float, reps: int,
         "-e", f"HF_HOME=/root/.cache/huggingface",
         "-e", "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         "-e", f"VIDEO_PATH={docker_video}",
-        # Force V0 single-process executor so the ViT runs in-process:
-        # thread-locals visible, gather op fires directly, CUDA timing works.
-        "-e", "VLLM_USE_V1=0",
     ]
     vol_mounts = [
         "-v", f"{HF_CACHE}:/root/.cache/huggingface",
