@@ -42,14 +42,14 @@ Three hooks monkey-patched in vLLM: `Qwen2_5VLVisionTransformer.forward` (gather
 ## Key findings
 
 
-**3. GPU AutoGaze brings E2E to near break-even (+1.7%).**  
-With AutoGaze on the GB200 inside Docker, preprocessing is ~1.2 s. The inference savings (943 ms) partially offset this overhead, leaving sparse_vit only **234 ms (+1.7%) slower** than dense_eager end-to-end — within run-to-run noise at this scale.
+**2. GPU AutoGaze is near break-even E2E (+1.7%).**  
+~1.2 s AutoGaze overhead on GB200 partially offsets the 943 ms inference savings → sparse_vit is only **234 ms slower** than dense_eager. Within run-to-run noise.
 
-**3. `enforce_eager` overhead is 156 ms — sparse_vit still beats unconstrained dense.**  
-EVS and sparse_vit require `enforce_eager=True` to activate pruning hooks, disabling CUDA graphs. This adds 156 ms vs plain dense (13,448 ms → 13,604 ms dense_eager). Even so, sparse_vit pure inference time (12,661 ms) is **5.9% faster than plain dense** — the sparse ViT + token savings outweigh both the eager-mode penalty and the CUDA-graph advantage dense gets for free.
+**3. `enforce_eager` costs 156 ms — sparse_vit still beats plain dense.**  
+Even with CUDA graphs disabled (required for pruning hooks), sparse_vit inference (12,661 ms) is **5.9% faster than dense** (13,448 ms, CUDA graphs on).
 
-**4. At comparable latency, sparse_vit can process 7× more video.**  
-sparse_vit uses 878 tokens vs 6,403 for dense at 32 frames — a **7.3× token reduction** with the same answer quality. Within a fixed latency budget (~13.6 s), this means sparse_vit could handle ~230 frames (7× longer video) where dense is limited to 32 frames. The token savings scale with video length, making sparse_vit increasingly advantageous for long-form video understanding.
+**4. At the same latency, sparse_vit processes 7× more video.**  
+878 vs 6,403 tokens at 32 frames (**7.3× reduction**, same answer quality). Within a ~13.6 s budget, sparse_vit scales to ~230 frames where dense caps at 32.
 
 ---
 
