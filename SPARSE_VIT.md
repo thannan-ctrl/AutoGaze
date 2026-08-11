@@ -33,9 +33,7 @@ Three hooks monkey-patched in vLLM: `Qwen2_5VLVisionTransformer.forward` (gather
 | evs | ✓ | — | 3,365 | 13,284 | — | 13,284 | −2.4% |
 | sparse\_vit | ✓ | GPU (inline) | 878 | 13,838 | ~bundled | 13,838 | +1.7% |
 | sparse\_vit | ✓ | CPU (external) | 924 | 12,661 | 19,267 | 31,928 | +135% |
-| **sparse\_vit†** | ✓ | CPU (infer only) | 924 | **12,661** | excluded | **12,661** | **−6.9%** |
 
-†Inference time only, AutoGaze preprocessing excluded from elapsed.  
 `dense_eager` = dense with `enforce_eager=True` (same mode as EVS/sparse_vit — no CUDA-graph advantage).
 
 ---
@@ -43,7 +41,7 @@ Three hooks monkey-patched in vLLM: `Qwen2_5VLVisionTransformer.forward` (gather
 ## Key findings
 
 **1. Inference speedup is real (−6.9% vs dense\_eager).**  
-With AutoGaze preprocessing excluded, sparse_vit (12,661 ms) beats dense_eager (13,604 ms) by 943 ms. Token reduction: 924 vs 6,403 (−86%). Both ViT compute and LM decode are cheaper.
+When counting only Docker inference time (12,661 ms) without the CPU AutoGaze preprocessing overhead, sparse_vit beats dense_eager (13,604 ms) by 943 ms. Token reduction: 924 vs 6,403 (−86%). Both ViT compute and LM decode are cheaper.
 
 **2. GPU AutoGaze makes sparse\_vit near break-even E2E (+1.7%).**  
 Running AutoGaze inside Docker on the GB200 bundles ~1–2 s of preprocessing into inference. The ViT+LM savings (~1.1 s) nearly cancel it. The 1.7% gap is within run-to-run noise.
