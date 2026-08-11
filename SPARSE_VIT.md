@@ -1,6 +1,6 @@
 # AutoGaze × vLLM — Sparse ViT
 
-**TL;DR:** We connected AutoGaze to vLLM to select patches *before* the ViT runs, reducing attention cost from O(N²) to O(K²). The sparse ViT fires correctly. Inference alone is 6.9% faster than a fair baseline. AutoGaze preprocessing (currently on CPU by mistake) is the remaining bottleneck — on GPU it becomes near break-even E2E.
+**TL;DR:** We connected AutoGaze to vLLM to select patches *before* the ViT runs, reducing attention cost from O(N²) to O(K²).
 
 ---
 
