@@ -85,13 +85,52 @@ def run_docker(mode: str, pruning_rate: float, reps: int,
 
     full = proc.stdout + "\n" + proc.stderr
     for line in full.splitlines():
-        if "RESULT_JSON" not in line:
+        if "RESULT_JSON" not in line and "VIT_TIMING_MS" not in line:
             print(f"  {line}")
+
+    # Collect VIT_TIMING_MS lines emitted by _hook_forward inside the
+    # EngineCore subprocess.  The subprocess inherits the container's stdout
+    # (shared file descriptor after fork), so these lines appear in the
+    # captured Docker output in inference-order.
+    vit_times = []
+    for line in full.splitlines():
+        s = line.strip()
+        if s.startswith("VIT_TIMING_MS:"):
+            try:
+                vit_times.append(float(s[len("VIT_TIMING_MS:"):]))
+            except ValueError:
+                pass
 
     for line in full.splitlines():
         if line.startswith("RESULT_JSON:"):
             r = json.loads(line[len("RESULT_JSON:"):])
             r["wall_ms"] = wall_ms
+
+            # Inject per-rep ViT timing into the result.
+            # vit_times[i] corresponds to rep i (the i-th llm.chat() call).
+            # With the vLLM encoder cache, reps 1+ may bypass the ViT entirely,
+            # so vit_times may have fewer entries than total reps.
+            if vit_times:
+                r["rep_vit_ms"] = vit_times
+                # Assign to individual rep records
+                for i, rep in enumerate(r.get("reps", [])):
+                    if i < len(vit_times):
+                        rep["vit_ms"] = vit_times[i]
+                        if rep.get("elapsed_ms") and vit_times[i]:
+                            rep["lm_ms"] = rep["elapsed_ms"] - vit_times[i]
+
+                # Primary (rep 0) timings
+                r["vit_ms"] = vit_times[0]
+                if r.get("elapsed_ms") and vit_times[0]:
+                    r["lm_ms"] = r["elapsed_ms"] - vit_times[0]
+
+                # Averages over measured reps (excluding warmup rep 0)
+                measured_vit = vit_times[1:] if len(vit_times) > 1 else []
+                if measured_vit:
+                    r["avg_vit_ms"] = sum(measured_vit) / len(measured_vit)
+                    if r.get("avg_elapsed_ms") and r["avg_vit_ms"]:
+                        r["avg_lm_ms"] = r["avg_elapsed_ms"] - r["avg_vit_ms"]
+
             return r
 
     raise RuntimeError(
@@ -107,102 +146,133 @@ def _fmt(val, unit="ms", precision=0):
     return f"{val:{6+precision}.{precision}f}{unit}"
 
 
+def _ms(val) -> str:
+    return f"{val:,.0f}" if val is not None else "n/a"
+
+
 def print_report(results: list[dict], pruning_rate: float, reps: int) -> None:
-    print("\n" + "=" * 80)
+    W = 90
+    print("\n" + "=" * W)
     print("END-TO-END RUNTIME ANALYSIS  —  AutoGaze × vLLM")
-    print("=" * 80)
+    print("=" * W)
     print(f"Model:         Qwen/Qwen3-VL-2B-Instruct")
     print(f"Video:         assets/example_input.mp4")
     print(f"Pruning rate:  {pruning_rate}")
-    print(f"Reps:          {reps}  (first=warmup, rest measured; avg reported)")
+    print(f"Reps:          {reps}  (rep 0 = cold; reps 1+ = warm / encoder-cached)")
     print()
 
     dense = next((r for r in results if r["mode"] == "dense"), None)
-    dense_tok  = dense["num_prompt_tokens"] if dense and dense.get("num_prompt_tokens", -1) > 0 else None
-    dense_vit  = dense.get("avg_vit_ms") or dense.get("vit_ms") if dense else None
-    dense_lm   = dense.get("avg_lm_ms")  or dense.get("lm_ms")  if dense else None
-    dense_inf  = dense.get("avg_elapsed_ms") or dense.get("elapsed_ms") if dense else None
+    dense_tok     = dense["num_prompt_tokens"] if dense and dense.get("num_prompt_tokens", -1) > 0 else None
+    dense_cold_ms = dense.get("elapsed_ms")    if dense else None
+    dense_cold_vit= dense.get("vit_ms")        if dense else None
 
-    # Header
+    # ── COLD table (rep 0: fresh model load, no GPU warmup) ──────────────────
+    print("COLD INFERENCE  (rep 0 — fresh container, no warmup, no encoder cache)")
     cols = [
-        ("Mode",          "<12"),
-        ("Tokens",        ">8"),
-        ("vs Dense",      ">9"),
-        ("Load (ms)",     ">10"),
-        ("ViT (ms)",      ">10"),
-        ("LM (ms)",       ">9"),
-        ("Infer (ms)",    ">11"),
-        ("Answer",        ">7"),
+        ("Mode",        "<13"),
+        ("Tokens",      ">7"),
+        ("vs Dense",    ">9"),
+        ("Load (ms)",   ">10"),
+        ("ViT (ms)",    ">10"),
+        ("LM (ms)",     ">9"),
+        ("Total (ms)",  ">11"),
+        ("Answer",      ">7"),
     ]
-    header = "  ".join(f"{h:{fmt}}" for h, fmt in cols)
-    sep    = "  ".join("-" * int(fmt.lstrip("<>^")) for _, fmt in cols)
-    print(header)
+    hdr = "  ".join(f"{h:{f}}" for h, f in cols)
+    sep = "  ".join("-" * int(f.lstrip("<>^")) for _, f in cols)
+    print(hdr)
     print(sep)
 
     for r in results:
         tok   = r.get("num_prompt_tokens", -1)
-        vit   = r.get("avg_vit_ms")   or r.get("vit_ms")
-        lm    = r.get("avg_lm_ms")    or r.get("lm_ms")
-        infer = r.get("avg_elapsed_ms") or r.get("elapsed_ms")
+        vit   = r.get("vit_ms")
+        lm    = r.get("lm_ms")
+        total = r.get("elapsed_ms")
         load  = r.get("load_ms")
-
-        vs = (f"-{(1 - tok/dense_tok)*100:.0f}%"
-              if dense_tok and tok > 0 and r["mode"] != "dense"
-              else "—")
-        vit_s  = f"{vit:.0f}" if vit else "n/a"
-        lm_s   = f"{lm:.0f}"  if lm  else "n/a"
-        inf_s  = f"{infer:.0f}" if infer else "n/a"
-        load_s = f"{load:.0f}" if load else "n/a"
-
+        vs    = (f"-{(1 - tok/dense_tok)*100:.0f}%"
+                 if dense_tok and tok > 0 and r["mode"] != "dense" else "—")
         print(
-            f"  {r['mode']:<12}  {tok:>8}  {vs:>9}  "
-            f"{load_s:>10}  {vit_s:>10}  "
-            f"{lm_s:>9}  {inf_s:>11}  {r.get('answer','?'):>7}"
+            f"  {r['mode']:<13}  {tok:>7}  {vs:>9}  "
+            f"{_ms(load):>10}  {_ms(vit):>10}  "
+            f"{_ms(lm):>9}  {_ms(total):>11}  {r.get('answer','?'):>7}"
         )
 
-    print()
+    # ── WARM table (avg reps 1+: GPU warm, but vLLM encoder cache active) ────
+    warm_available = any(r.get("avg_elapsed_ms") for r in results
+                         if (r.get("avg_elapsed_ms") or 0) < (r.get("elapsed_ms") or 1e9))
+    if warm_available and reps > 1:
+        print()
+        print("WARM INFERENCE  (avg reps 1+ — GPU warm; NOTE: vLLM encoder cache active → fast)")
+        print(hdr)
+        print(sep)
+        for r in results:
+            tok   = r.get("num_prompt_tokens", -1)
+            vit   = r.get("avg_vit_ms")
+            lm    = r.get("avg_lm_ms")
+            total = r.get("avg_elapsed_ms")
+            load  = r.get("load_ms")
+            vs    = (f"-{(1 - tok/dense_tok)*100:.0f}%"
+                     if dense_tok and tok > 0 and r["mode"] != "dense" else "—")
+            print(
+                f"  {r['mode']:<13}  {tok:>7}  {vs:>9}  "
+                f"{'—':>10}  {_ms(vit):>10}  "
+                f"{_ms(lm):>9}  {_ms(total):>11}  {r.get('answer','?'):>7}"
+            )
 
-    # Speedup summary
-    if dense_inf:
-        print("Speedup over dense (inference only, excluding model load):")
+    # ── Speedup summary ───────────────────────────────────────────────────────
+    print()
+    if dense_cold_ms:
+        print("Speedup over dense  (cold inference, rep 0):")
         for r in results:
             if r["mode"] == "dense":
                 continue
-            inf = r.get("avg_elapsed_ms") or r.get("elapsed_ms")
+            inf = r.get("elapsed_ms")
             if inf:
-                speedup = dense_inf / inf
-                print(f"  {r['mode']:<12}  {speedup:.2f}×  ({inf:.0f} ms vs {dense_inf:.0f} ms)")
+                speedup = dense_cold_ms / inf
+                sign = "×" if speedup >= 1 else "× (slower)"
+                print(f"  {r['mode']:<13}  {speedup:.2f}{sign}  "
+                      f"({_ms(inf)} ms vs {_ms(dense_cold_ms)} ms)")
 
-    if dense_vit:
-        print("\nViT speedup (sparse_vit only):")
+    evs = next((r for r in results if r["mode"] == "evs"), None)
+    evs_vit = evs.get("vit_ms") if evs else None
+    if dense_cold_vit and evs_vit:
+        print()
+        print("ViT timing breakdown  (cold, from CUDA events in EngineCore subprocess):")
+        print(f"  dense      ViT: {_ms(dense_cold_vit)} ms")
+        print(f"  evs        ViT: {_ms(evs_vit)} ms")
         for r in results:
-            if r["mode"] != "sparse_vit":
-                continue
-            vit = r.get("avg_vit_ms") or r.get("vit_ms")
-            if vit:
-                vs_speedup = dense_vit / vit
-                print(f"  sparse_vit ViT:  {vit:.0f} ms vs dense {dense_vit:.0f} ms  →  {vs_speedup:.2f}×")
+            if r["mode"] == "sparse_vit":
+                svit = r.get("vit_ms")
+                if svit:
+                    print(f"  sparse_vit ViT: {_ms(svit)} ms")
+                    print(f"  sparse_vit vs EVS ViT speedup: {evs_vit/svit:.2f}×  "
+                          f"({_ms(svit)} ms vs {_ms(evs_vit)} ms)")
+                    print(f"  (K/N)² theoretical: "
+                          f"{(r.get('K_vit',0) or 0) and f\"{(r['K_vit']/max(r.get('K_vit',1),1))**2:.2f}×\" or 'n/a'}")
 
-    # Per-rep breakdown for sparse_vit (if available)
+    elif not (dense_cold_vit or evs_vit):
+        print()
+        print("ViT timing: n/a — hook did not fire or VIT_TIMING_MS not found in Docker output.")
+        print("  Check that git pull got the latest commit and Docker container output is not suppressed.")
+
+    # ── Per-rep detail ────────────────────────────────────────────────────────
+    print()
+    print("Per-rep detail:")
     for r in results:
-        rep_data = r.get("reps")
-        if rep_data and len(rep_data) > 1:
-            measured = rep_data[1:]
-            elapsed_vals = [x["elapsed_ms"] for x in measured if x["elapsed_ms"]]
-            vit_vals     = [x["vit_ms"]     for x in measured if x.get("vit_ms")]
-            if elapsed_vals:
-                print(f"\n  {r['mode']} per-rep (excluding warmup):")
-                print(f"    elapsed: min={min(elapsed_vals):.0f}  "
-                      f"mean={statistics.mean(elapsed_vals):.0f}  "
-                      f"max={max(elapsed_vals):.0f} ms")
-            if vit_vals:
-                print(f"    vit:     min={min(vit_vals):.0f}  "
-                      f"mean={statistics.mean(vit_vals):.0f}  "
-                      f"max={max(vit_vals):.0f} ms")
+        reps_data = r.get("reps", [])
+        if not reps_data:
+            continue
+        print(f"  {r['mode']}:")
+        for rep in reps_data:
+            label = "warmup" if rep["rep"] == 0 and len(reps_data) > 1 else f"rep {rep['rep']}"
+            vit_s = f"  vit={rep['vit_ms']:.0f}ms" if rep.get("vit_ms") else ""
+            lm_s  = f"  lm={rep['lm_ms']:.0f}ms"   if rep.get("lm_ms")  else ""
+            print(f"    [{label}]  elapsed={_ms(rep.get('elapsed_ms'))} ms{vit_s}{lm_s}  "
+                  f"tokens={rep.get('num_prompt_tokens','?')}  answer={rep.get('answer','?')}")
 
     print()
     print(f"Results saved to: {RESULTS_FILE}")
-    print("=" * 80)
+    print("=" * W)
 
 
 def main():

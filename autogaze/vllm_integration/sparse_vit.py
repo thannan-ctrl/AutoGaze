@@ -594,6 +594,7 @@ def install_import_hook() -> None:
 
                 def _hook_forward(self_enc, *args, **kwargs):
                     import torch as _torch
+                    import sys as _sys
                     start = _torch.cuda.Event(enable_timing=True)
                     end = _torch.cuda.Event(enable_timing=True)
                     start.record()
@@ -609,9 +610,14 @@ def install_import_hook() -> None:
                     _torch.cuda.synchronize()
                     ms = start.elapsed_time(end)
                     _vit_timing.ms = ms
-                    # Write to mmap so main process can read it.
-                    # _vit_timing_buf is MAP_ANONYMOUS|MAP_SHARED, so writes
-                    # in this child are immediately visible to the parent.
+
+                    # Print to stdout — the EngineCore subprocess inherits the
+                    # Docker container's stdout, so runtime_analysis.py sees
+                    # this line in the captured Docker output and can parse it.
+                    # This sidesteps all cross-process shared-memory issues.
+                    print(f"VIT_TIMING_MS:{ms:.3f}", flush=True, file=_sys.stdout)
+
+                    # Also attempt mmap write as belt-and-suspenders.
                     if _vit_timing_buf is not None:
                         import struct as _struct
                         _struct.pack_into("d", _vit_timing_buf, 0, ms)
