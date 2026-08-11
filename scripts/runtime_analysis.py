@@ -385,7 +385,11 @@ def main():
     # ── Pre-compute AutoGaze mask outside Docker (original two-env flow) ──────
     preprocess_ms = None
     if external_autogaze and "sparse_vit" in modes:
-        host_video = os.path.join(REPO_DIR, "assets", "example_input.mp4")
+        # Use the same video that will be passed to Docker
+        host_video = args.video or os.path.join(REPO_DIR, "assets", "example_input.mp4")
+        # Resolve docker-side path to host path
+        if host_video.startswith("/workspace/AutoGaze/"):
+            host_video = os.path.join(REPO_DIR, host_video[len("/workspace/AutoGaze/"):])
         preprocess_ms = run_autogaze_preprocess(
             video_path=host_video,
             gazing_ratio=args.gazing_ratio,
