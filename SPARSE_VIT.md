@@ -9,89 +9,34 @@ AutoGaze pre-selects which video patches matter before the Vision Transformer (V
 ## Pipeline
 
 ```
-  Video frames (T frames, 448×448)
+Video (T frames)
+  │
+  ├─ AutoGaze (ShallowVideoConvNet + LLaMA-4L)
+  │    → bool mask (T×28×28),  K = selected patches  [adaptive, stops when confident]
+  │
+  │    mask written to file ──────────────────────────────────────────────┐
+  │                                                                        │ IPC
+  └─ vLLM (main process)                                                  ▼
+       │                                              EngineCore subprocess
+       │  Hook 1: compute_retained_tokens_count       ┌──────────────────────────┐
+       │          reads K/4 from context              │ patch_embed(all N)  cheap │
+       │          → correct KV-cache allocation       │        │                  │
+       │                                              │  GATHER K  ◄── mask      │
+       │                                              │        │   K ≪ N          │
+       │                                              │  blocks(K)  O(K²) attn   │
+       │                                              │        │   vs O(N²) dense │
+       │                                              │  merger → K/4 tokens     │
+       │  Hook 2: compute_retention_mask              └──────────────────────────┘
+       │          → identity (ViT already pruned)
        │
-       │
-       ▼
- ┌─────────────────────────────────────┐
- │          AutoGaze Preprocessor      │  ← nvidia/AutoGaze
- │                                     │
- │  ShallowVideoConvNet (per-frame)    │
- │  + 4-layer LLaMA decoder            │
- │                                     │
- │  Stops early per frame when         │
- │  task_loss_prediction_head is       │
- │  confident → adaptive K             │
- │                                     │
- │  Output: bool mask (T×28×28)        │
- │          K_vit = True count         │
- └──────────────┬──────────────────────┘
-                │
-                │  SparseViTContext writes mask
-                │  to shared file before llm.chat()
-                │  (cross-process IPC: main → EngineCore)
-                │
-                ▼
- ┌──────────────────────────────────────────────────────────────────┐
- │                        vLLM V1 Engine                            │
- │                                                                  │
- │  ┌──────────────────┐   fork    ┌──────────────────────────────┐│
- │  │   main process   │ ────────► │   EngineCore subprocess      ││
- │  │                  │           │                              ││
- │  │  Hook 1 (pre-ViT)│           │  Qwen2_5VLVisionTransformer  ││
- │  │  ───────────────  │           │  .forward   (import-hook     ││
- │  │  compute_retained │           │             patched)         ││
- │  │  _tokens_count    │           │                              ││
- │  │  reads K_merged   │           │  pixel_values                ││
- │  │  from context     │           │  (N = T×28×28 patches)       ││
- │  │  → correct KV     │           │       │                      ││
- │  │    cache alloc    │           │  patch_embed  (all N, cheap) ││
- │  │                   │           │       │  (N, D)              ││
- │  │                   │           │       │                      ││
- │  │                   │           │  reads mask from file        ││
- │  │                   │           │       │                      ││
- │  │                   │           │  ┌────┴──────┐               ││
- │  │                   │           │  │  GATHER K │  K ≪ N       ││
- │  │                   │           │  └────┬──────┘               ││
- │  │                   │           │       │  (K, D)              ││
- │  │                   │           │       │                      ││
- │  │                   │           │  transformer blocks          ││
- │  │                   │           │  O(K²) attn vs O(N²) dense  ││
- │  │                   │           │       │                      ││
- │  │                   │           │  spatial merger (2×2)        ││
- │  │                   │           │       │  (K/4, D)            ││
- │  │                   │           │       ▼                      ││
- │  │  Hook 2 (post-ViT)│ ◄──────── │  K/4 visual tokens          ││
- │  │  ───────────────  │           │                              ││
- │  │  compute_retention│           └──────────────────────────────┘│
- │  │  _mask            │                                            │
- │  │  → all-True       │  ViT already pruned; no post-ViT          │
- │  │    identity       │  selection needed                          │
- │  └──────────────────┘                                            │
- │                                                                  │
- │  K/4 visual tokens  +  text tokens                               │
- │           │                                                      │
- │           ▼                                                      │
- │        ┌─────┐                                                   │
- │        │ LLM │  processes far fewer tokens than dense            │
- │        └──┬──┘                                                   │
- │           │                                                      │
- └───────────┼──────────────────────────────────────────────────────┘
-             │
-             ▼
-           Answer
+       └─ LLM (K/4 visual + text tokens) → Answer
 ```
 
-**Dense path (no AutoGaze):** `pixel_values → patch_embed → blocks (ALL N) → merger → LLM (N/4 tokens)`  
-**Sparse path (AutoGaze):**   `pixel_values → patch_embed → GATHER K → blocks (K only) → merger → LLM (K/4 tokens)`
-
-The three monkey-patches that make this work:
-
-| Hook | Where | What it does |
-|---|---|---|
-| `Qwen2_5VLVisionTransformer.forward` | EngineCore subprocess (import hook) | Inserts the gather op between `patch_embed` and transformer blocks |
-| `compute_retained_tokens_count` | main process (before ViT) | Tells vLLM's scheduler to allocate K/4 KV-cache slots instead of N/4 |
-| `compute_retention_mask` | main process (after ViT) | Returns all-True — ViT already pruned, no post-ViT EVS needed |
+| Hook | Effect |
+|---|---|
+| `Qwen2_5VLVisionTransformer.forward` | Inserts gather op: `patch_embed(N) → gather K → blocks(K) → merger` |
+| `compute_retained_tokens_count` | Reserves K/4 KV-cache slots (not N/4) |
+| `compute_retention_mask` | All-True identity — no post-ViT pruning needed |
 
 ---
 
