@@ -62,10 +62,10 @@ Usage:
 """
 from __future__ import annotations
 
-import ctypes
+import mmap
 import os
+import struct
 import threading
-from multiprocessing import Value
 from typing import Optional, Tuple
 
 import torch
@@ -80,19 +80,23 @@ _PATCHED_ENCODERS: dict = {}   # id(encoder) → original_forward
 # (inside the same Docker container) lets _sparse_vit_forward read it.
 _IPC_PATH = os.environ.get("SPARSE_VIT_IPC_PATH", "/tmp/_autogaze_sparse_vit_ctx.pt")
 
-# Shared-memory slot for cross-process ViT timing.
-# Must be created BEFORE fork (i.e., before LLM()) so both parent and child
-# map the same physical memory page.  -1.0 = not yet written.
-# Call setup_timing_shm() once before install_import_hook().
-_vit_timing_shm: Optional[Value] = None
+# Anonymous mmap for cross-process ViT timing.
+# mmap(-1, 8) on Linux uses MAP_ANONYMOUS|MAP_SHARED — the physical page is
+# shared between parent and child after fork, so child writes are visible
+# to parent immediately.  multiprocessing.Value has post-fork lock issues on
+# Python 3.12; raw mmap avoids them.
+# Must be created BEFORE fork (i.e., before LLM()).
+_vit_timing_buf: Optional[mmap.mmap] = None
+_VIT_TIMING_SENTINEL = -1.0
 
 
-def setup_timing_shm() -> Value:
-    """Create the shared-memory timing slot (call once, before LLM())."""
-    global _vit_timing_shm
-    if _vit_timing_shm is None:
-        _vit_timing_shm = Value(ctypes.c_double, -1.0)
-    return _vit_timing_shm
+def setup_timing_shm() -> mmap.mmap:
+    """Create the shared-memory timing buf (call once, before LLM())."""
+    global _vit_timing_buf
+    if _vit_timing_buf is None:
+        _vit_timing_buf = mmap.mmap(-1, 8)   # 8 bytes = one float64
+        struct.pack_into("d", _vit_timing_buf, 0, _VIT_TIMING_SENTINEL)
+    return _vit_timing_buf
 
 # ---------------------------------------------------------------------------
 # CUDA event timing hook (used by runtime_analysis, independent of sparse ViT)
@@ -147,12 +151,11 @@ def get_vit_ms() -> Optional[float]:
     ms = getattr(_vit_timing, "ms", None)
     if ms is not None:
         return ms
-    # Subprocess path: shared memory written by import hook inside EngineCore.
-    # Works because _vit_timing_shm is created before fork and both parent and
-    # child map the same physical page.
-    if _vit_timing_shm is not None:
-        v = _vit_timing_shm.value
-        if v >= 0.0:
+    # Subprocess path: mmap written by import hook inside EngineCore subprocess.
+    # Both parent and child map the same physical page (MAP_ANONYMOUS|MAP_SHARED).
+    if _vit_timing_buf is not None:
+        v = struct.unpack_from("d", _vit_timing_buf, 0)[0]
+        if v != _VIT_TIMING_SENTINEL:
             return v
     return None
 
@@ -606,11 +609,12 @@ def install_import_hook() -> None:
                     _torch.cuda.synchronize()
                     ms = start.elapsed_time(end)
                     _vit_timing.ms = ms
-                    # Write to shared memory so main process can read it.
-                    # _vit_timing_shm is created before fork, so both parent
-                    # and child map the same physical page — no file I/O needed.
-                    if _vit_timing_shm is not None:
-                        _vit_timing_shm.value = ms
+                    # Write to mmap so main process can read it.
+                    # _vit_timing_buf is MAP_ANONYMOUS|MAP_SHARED, so writes
+                    # in this child are immediately visible to the parent.
+                    if _vit_timing_buf is not None:
+                        import struct as _struct
+                        _struct.pack_into("d", _vit_timing_buf, 0, ms)
                     return result
 
                 cls.forward = _hook_forward
