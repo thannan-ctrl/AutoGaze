@@ -15,7 +15,7 @@ CUDA_VISIBLE_DEVICES=<gpu> REPO_DIR=$(pwd) NVILA_DEVICE=cuda:0 \
 # dense reference points (nvf=128/256):  scripts/nvila_hd_length_sweep.py
 ```
 
----
+<!-- ---
 ## 2. Batch-size scaling @ matched nvf=16
 ![Batch sweep](assets/nvf16_summary_plots/exp1_batch_sweep.png)
 
@@ -23,10 +23,10 @@ CUDA_VISIBLE_DEVICES=<gpu> REPO_DIR=$(pwd) NVILA_DEVICE=cuda:0 \
 NUM_VIDEO_FRAMES=16 CUDA_VISIBLE_DEVICES=<gpu> REPO_DIR=$(pwd) NVILA_DEVICE=cuda:0 \
   python3 scripts/nvila_hd_stress_test.py
 # batched variant: add MAX_BATCH_SIZE_AUTOGAZE=64 (env var, defaults to 16)
-```
+``` -->
 
 ---
-## 3. Time breakdown: EgoSchema
+## 2. Time breakdown: EgoSchema
 ![Stage breakdown](assets/nvf16_summary_plots/exp3_stage_breakdown.png)
 
 **Why EgoSchema is much slower for AutoGaze than the square test video in Section 1**: it's a
@@ -46,12 +46,12 @@ CUDA_VISIBLE_DEVICES=<gpu> REPO_DIR=$(pwd) NVILA_DEVICE=cuda:0 \
 ```
 
 ---
-## 4. Accuracy: dense vs AutoGaze
+## 3. Accuracy: dense vs AutoGaze
 ![Accuracy comparison](assets/nvf16_summary_plots/exp3_6_accuracy.png)
 
 *(same run as Section 3 — `nvila_hd_accuracy_test.py` reports accuracy and the preproc/ViT/LLM
 breakdown together in one pass.)*
 
 ---
-## 5. Proposed (not implemented): distill AutoGaze into a non-autoregressive student
+## 4. Proposed (not implemented): distill AutoGaze into a non-autoregressive student
 ![Student distillation concept](assets/nvf16_summary_plots/autogaze_student_distillation_proposal.png)
