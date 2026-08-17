@@ -321,17 +321,16 @@ class LlamaForCausalLM_MultiTokenPred(LlamaPreTrainedModel, GenerationMixin):
                     embed_len = cur_len
                 model_kwargs["cache_position"] = torch.arange(embed_len, device=input_ids.device)
 
+        # NOTE: the original transformers.generation.utils.GenerationMixin._sample this method is
+        # copied from used to gate auto-compilation on `self._supports_static_cache`, a class flag
+        # that no longer exists on PreTrainedModel/LlamaForCausalLM in this transformers version
+        # (confirmed: neither the real LlamaForCausalLM nor its bases declare it here) -- current
+        # transformers replaced that check with `self._valid_auto_compile_criteria(...)`, an
+        # unmodified, model-agnostic GenerationMixin method (not overridden by this subclass), so
+        # this is a compatibility re-sync, not new behavior.
         model_forward = self.__call__
-        if isinstance(model_kwargs.get("past_key_values"), Cache):
-            is_compileable = model_kwargs["past_key_values"].is_compileable and self._supports_static_cache
-            if getattr(self, "hf_quantizer", None) is not None:
-                is_compileable &= self.hf_quantizer.is_compileable
-            is_compileable = is_compileable and not generation_config.disable_compile
-            if is_compileable and (
-                self.device.type == "cuda" or generation_config.compile_config._compile_all_devices
-            ):
-                os.environ["TOKENIZERS_PARALLELISM"] = "0"
-                model_forward = self.get_compiled_call(generation_config.compile_config)
+        if self._valid_auto_compile_criteria(model_kwargs, generation_config):
+            model_forward = self.get_compiled_call(generation_config.compile_config)
 
         if generation_config.prefill_chunk_size is not None:
             model_kwargs = self._prefill_chunking(input_ids, generation_config, **model_kwargs)

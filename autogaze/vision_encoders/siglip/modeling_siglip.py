@@ -45,7 +45,7 @@ from transformers.utils import (
     torch_int,
 )
 from .configuration_siglip import SiglipVisionConfig, SiglipConfig
-from transformers.models.siglip.modeling_siglip import _trunc_normal_, trunc_normal_tf_, variance_scaling_, lecun_normal_, default_flax_embed_init
+from transformers.initialization import lecun_normal_, default_flax_embed_init_ as default_flax_embed_init
 
 
 logger = logging.get_logger(__name__)

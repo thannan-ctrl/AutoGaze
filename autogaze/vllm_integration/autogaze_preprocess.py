@@ -48,6 +48,17 @@ class AutoGazePreprocessor:
     IMG_MEAN = (0.485, 0.456, 0.406)
     IMG_STD  = (0.229, 0.224, 0.225)
     MAX_FRAMES_PER_CHUNK = 16  # AutoGaze processes max 16 frames at once
+    # How many independent 16-frame chunks to run in one batched AutoGaze call.
+    # Default 1 == original sequential-per-chunk behavior (byte-identical
+    # output). Chunks don't share state, so batching them is a pure speed
+    # lever, BUT batched vs. sequential matmul/attention kernels use a
+    # different reduction order, which can flip an occasional greedy-argmax
+    # gaze decision and cascade through the chunk's autoregressive per-frame
+    # decode (verified: no cross-item state leakage, purely floating-point
+    # kernel non-determinism -- see scripts/diagnose_autogaze_batch_divergence*.py).
+    # Opt in explicitly (e.g. AutoGazePreprocessor.MAX_CHUNKS_PER_BATCH = 8)
+    # once this drift has been validated against downstream accuracy.
+    MAX_CHUNKS_PER_BATCH = 1
 
     def __init__(self, model):
         self.model = model
@@ -60,8 +71,14 @@ class AutoGazePreprocessor:
 
         # transformers 5.x renamed _tied_weights_keys → all_tied_weights_keys (as a dict).
         # Patch the class for backward compat with the local AutoGaze code.
+        # PreTrainedModel.post_init() assigns to this attribute, so the patched
+        # property needs a setter (a read-only property raises AttributeError
+        # there before the model can even be constructed).
         if not hasattr(AutoGaze, "all_tied_weights_keys"):
-            AutoGaze.all_tied_weights_keys = property(lambda self: {})
+            AutoGaze.all_tied_weights_keys = property(
+                lambda self: getattr(self, "_all_tied_weights_keys", {}),
+                lambda self, value: setattr(self, "_all_tied_weights_keys", value),
+            )
 
         ag = AutoGaze.from_pretrained(model_id)
         ag = ag.to(device).eval()
@@ -112,21 +129,44 @@ class AutoGazePreprocessor:
         # Fix random seed for reproducible K selection across runs
         torch.manual_seed(seed)
 
-        # AutoGaze processes in temporal chunks of max_chunk frames
-        all_masks = []
-        for start in range(0, T, max_chunk):
-            chunk = frames_224[start:start + max_chunk]  # (t, C, H, W)
-            # AutoGaze expects (B, T, C, H, W)
-            video = chunk.unsqueeze(0)  # (1, t, C, H, W)
+        # AutoGaze processes in temporal chunks of max_chunk frames. Chunks are
+        # independent (no shared state/cache across them), so full-size chunks
+        # are stacked into the batch dimension and run through AutoGaze together
+        # instead of one sequential call per chunk -- this is the dominant cost
+        # of AutoGaze preprocessing at high frame counts (see
+        # nvila_hd_nvf16_experiments.md Experiment 2/4), and chunk independence
+        # makes it a pure batching win with no change to per-chunk outputs.
+        n_full_chunks = T // max_chunk
+        full_chunk_starts = [i * max_chunk for i in range(n_full_chunks)]
+        ragged_start = n_full_chunks * max_chunk
+        has_ragged = ragged_start < T
+
+        all_masks = [None] * (n_full_chunks + (1 if has_ragged else 0))
+
+        def run_batch(chunk_list, order_indices):
+            # chunk_list: list of (t, C, H, W) tensors, all with the same t
+            video = torch.stack(chunk_list, dim=0)  # (Bc, t, C, H, W)
             output = self.model.forward(
                 inputs={"video": video},
                 gazing_ratio=gazing_ratio,
                 task_loss_requirement=task_loss_requirement,
                 generate_only=True,
             )
-            # gazing_mask: list of (B, T_chunk, N_scale) per scale; last = 224-scale
-            mask_224 = output["gazing_mask"][-1]  # (1, t, N_224) float 0/1
-            all_masks.append(mask_224.squeeze(0))  # (t, N_224)
+            # gazing_mask: list of (Bc, t, N_scale) per scale; last = 224-scale
+            mask_224 = output["gazing_mask"][-1]  # (Bc, t, N_224) float 0/1
+            for i, idx in enumerate(order_indices):
+                all_masks[idx] = mask_224[i]  # (t, N_224)
+
+        for batch_start in range(0, len(full_chunk_starts), self.MAX_CHUNKS_PER_BATCH):
+            batch_starts = full_chunk_starts[batch_start:batch_start + self.MAX_CHUNKS_PER_BATCH]
+            chunk_list = [frames_224[s:s + max_chunk] for s in batch_starts]
+            order_indices = list(range(batch_start, batch_start + len(batch_starts)))
+            run_batch(chunk_list, order_indices)
+
+        if has_ragged:
+            # Shorter trailing chunk can't be stacked with the fixed-size ones
+            # (batching requires uniform T), so it runs on its own.
+            run_batch([frames_224[ragged_start:T]], [n_full_chunks])
 
         mask_flat = torch.cat(all_masks, dim=0)  # (T, N_224) float 0/1
 

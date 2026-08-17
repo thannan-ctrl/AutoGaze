@@ -44,6 +44,8 @@ class AutoGaze(PreTrainedModel):
         self.has_task_loss_requirement_during_training = config.has_task_loss_requirement_during_training
         self.has_task_loss_requirement_during_inference = config.has_task_loss_requirement_during_inference
         self.task_loss_requirement_config = config.task_loss_requirement_config
+
+        self.post_init()
     
     def get_gazing_ratio(self, sync_across_ranks=True):
         """

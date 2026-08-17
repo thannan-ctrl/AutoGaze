@@ -14,16 +14,6 @@ Tasks 2+3 — Sparse ViT encoding:
     only on K selected patch embeddings (gathered after patch_embed), saving
     O(K²/N²) attention FLOPs and O(K/N) FFN FLOPs at inference time.
 
-Usage — post-ViT AutoGaze (Tasks 1):
-    from autogaze.vllm_integration.patch import apply_autogaze_patch
-    from autogaze.vllm_integration.retention import AutoGazeContext
-
-    apply_autogaze_patch(mode="autogaze")   # before LLM(...)
-    llm = LLM(..., video_pruning_rate=0.5)
-
-    with AutoGazeContext(ag_mask=mask, K=K):
-        outputs = llm.chat(messages)
-
 Usage — sparse ViT (Tasks 1+2+3):
     from autogaze.vllm_integration.patch import apply_autogaze_patch
     from autogaze.vllm_integration.retention import AutoGazeContext
@@ -34,6 +24,6 @@ Usage — sparse ViT (Tasks 1+2+3):
     patch_sparse_vit(llm)                   # after LLM(...)
 
     with SparseViTContext(mask=mask_vit, K=K_vit, grid_thw=(T, 32, 32)):
-        with AutoGazeContext(K=K_merged):   # ag_mask=None → identity retention
+        with AutoGazeContext(K=K_merged):   # identity retention mask (sparse ViT pass-through)
             outputs = llm.chat(messages)
 """

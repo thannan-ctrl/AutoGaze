@@ -57,7 +57,7 @@ Usage:
     #    - SparseViTContext drives the pre-ViT gather op
     #    - AutoGazeContext(K=K_merged) drives adaptive K + identity retention mask
     with SparseViTContext(mask=mask_vit, K=K_vit, grid_thw=(T, 32, 32)):
-        with AutoGazeContext(K=K_merged):   # ag_mask=None → sparse-ViT pass-through
+        with AutoGazeContext(K=K_merged):   # identity retention mask (sparse-ViT pass-through)
             outputs = llm.chat(messages, ...)
 """
 from __future__ import annotations
@@ -279,7 +279,14 @@ def _find_visual_encoder(llm) -> Optional[object]:
     # ── Class-level discovery (vLLM ≥0.24 V1, model in EngineCore subprocess) ─
     # Patch the class before the model is loaded so the patch is inherited by
     # the EngineCore process.  Caller must invoke patch_sparse_vit() BEFORE LLM().
+    #
+    # NOTE: as of vllm==0.26.0 (this environment), Qwen3VL ships its own vision
+    # transformer class -- Qwen3_VisionTransformer -- distinct from the Qwen2.5VL
+    # one. The two have different forward() signatures (see _sparse_vit_forward
+    # docstring), so Qwen3_VisionTransformer must be tried first / matched
+    # exactly, not treated as interchangeable with the Qwen2.5VL classes below.
     for cls_path in [
+        ("vllm.model_executor.models.qwen3_vl",   "Qwen3_VisionTransformer"),
         ("vllm.model_executor.models.qwen3_vl",   "Qwen2_5VLVisionTransformer"),
         ("vllm.model_executor.models.qwen2_5_vl", "Qwen2_5VLVisionTransformer"),
         ("vllm.model_executor.models.qwen2_vl",   "Qwen2VLVisionTransformer"),
@@ -306,49 +313,52 @@ def _find_visual_encoder(llm) -> Optional[object]:
 # Sparse ViT forward (Task 3: gather op)
 # ---------------------------------------------------------------------------
 
-def _run_blocks(
+def _run_blocks_qwen3(
     blocks,
+    deepstack_visual_indexes: list,
+    deepstack_merger_list,
     hidden_states: torch.Tensor,
-    cu_seqlens: Optional[torch.Tensor],
-    rotary_pos_emb: Optional[torch.Tensor],
-) -> torch.Tensor:
-    """Run transformer blocks with flexible signature (handles Qwen2.5/3-VL variants)."""
-    for blk in blocks:
-        try:
-            if cu_seqlens is not None and rotary_pos_emb is not None:
-                hidden_states = blk(
-                    hidden_states,
-                    cu_seqlens=cu_seqlens,
-                    rotary_pos_emb=rotary_pos_emb,
-                )
-            elif cu_seqlens is not None:
-                hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens)
-            elif rotary_pos_emb is not None:
-                hidden_states = blk(hidden_states, rotary_pos_emb=rotary_pos_emb)
-            else:
-                hidden_states = blk(hidden_states)
-        except TypeError as exc:
-            # Unknown signature — positional only
-            print(f"[SparseViT] Block TypeError ({exc}), falling back to positional call.", flush=True)
-            hidden_states = blk(hidden_states)
-    return hidden_states
+    encoder_metadata: dict,
+) -> Tuple[torch.Tensor, list]:
+    """
+    Run Qwen3VL transformer blocks with the current (vllm==0.26.0) block
+    signature: blk(hidden_states, cu_seqlens=, rotary_pos_emb_cos=,
+    rotary_pos_emb_sin=, max_seqlen=, sequence_lengths=). Collects deepstack
+    intermediate features at the configured layer indices, mirroring
+    Qwen3_VisionTransformer.forward() exactly (vllm/model_executor/models/
+    qwen3_vl.py lines ~800-841 in this environment's installed version).
+    """
+    deepstack_feature_lists = []
+    for layer_num, blk in enumerate(blocks):
+        hidden_states = blk(
+            hidden_states,
+            cu_seqlens=encoder_metadata["cu_seqlens"],
+            rotary_pos_emb_cos=encoder_metadata["rotary_pos_emb_cos"],
+            rotary_pos_emb_sin=encoder_metadata["rotary_pos_emb_sin"],
+            max_seqlen=encoder_metadata["max_seqlen"],
+            sequence_lengths=encoder_metadata.get("sequence_lengths"),
+        )
+        if layer_num in deepstack_visual_indexes:
+            idx = deepstack_visual_indexes.index(layer_num)
+            deepstack_feature_lists.append(deepstack_merger_list[idx](hidden_states))
+    return hidden_states, deepstack_feature_lists
 
 
 def _dense_from_embedded(
     encoder,
     hidden_states: torch.Tensor,
-    rotary_pos_emb: Optional[torch.Tensor],
-    grid_thw_arg,
+    grid_thw_list: list,
 ) -> torch.Tensor:
     """Dense ViT forward starting from already-embedded patches (skip patch_embed)."""
-    cu_seqlens = None
-    if grid_thw_arg is not None:
-        lengths = (grid_thw_arg[:, 1] * grid_thw_arg[:, 2]).repeat_interleave(grid_thw_arg[:, 0])
-        cu_seqlens = F.pad(lengths.cumsum(0, dtype=torch.int32), (1, 0))
-    hidden_states = _run_blocks(encoder.blocks, hidden_states, cu_seqlens, rotary_pos_emb)
-    if hasattr(encoder, "merger"):
-        hidden_states = encoder.merger(hidden_states)
-    return hidden_states
+    encoder_metadata = encoder.prepare_encoder_metadata(grid_thw_list)
+    hidden_states = hidden_states + encoder_metadata["pos_embeds"]
+    hidden_states = hidden_states.unsqueeze(1)
+    hidden_states, deepstack_feature_lists = _run_blocks_qwen3(
+        encoder.blocks, encoder.deepstack_visual_indexes, encoder.deepstack_merger_list,
+        hidden_states, encoder_metadata,
+    )
+    hidden_states = encoder.merger(hidden_states)
+    return torch.cat([hidden_states] + deepstack_feature_lists, dim=1)
 
 
 def _sparse_vit_forward(
@@ -359,31 +369,67 @@ def _sparse_vit_forward(
     **kwargs,
 ) -> torch.Tensor:
     """
-    Sparse ViT forward for Qwen2.5/3-VL:
+    Sparse ViT forward for Qwen3VL (vllm==0.26.0's Qwen3_VisionTransformer —
+    see vllm/model_executor/models/qwen3_vl.py, class Qwen3_VisionTransformer,
+    for the reference dense forward() this mirrors).
 
+    Architecture this targets differs from the older Qwen2.5VL-style gather
+    this function previously assumed:
+      - Positional embeddings come from `fast_pos_embed_interpolate` (a
+        bicubic-style interpolation over a learned (num_grid_per_side**2, D)
+        table), not a `rot_pos_emb`-only scheme — must be gathered at the
+        same selected indices as the patch embeddings.
+      - Rotary embeddings are two separate tensors (`rotary_pos_emb_cos`,
+        `rotary_pos_emb_sin`), not one combined tensor.
+      - `cu_seqlens`/`sequence_lengths`/`max_seqlen` are backend-specific
+        (computed via `MMEncoderAttention` static methods keyed off
+        `encoder.attn_backend`) rather than a hand-built flash-attn cu_seqlens.
+      - Deepstack: intermediate features at `encoder.deepstack_visual_indexes`
+        each go through their own `deepstack_merger_list[i]`, then get
+        concatenated onto the final merged output along the feature dim.
+
+    Steps:
     1. patch_embed  — runs on ALL N patches (lightweight conv/linear)
-    2. [GATHER]     — select K patches via AutoGaze mask
+    2. [GATHER]     — select K patches via AutoGaze mask (patch embeddings,
+                       positional embeddings, and rotary cos/sin all gathered
+                       at the same indices)
     3. blocks       — run transformer on K patches only  (Task 3)
-    4. merger       — spatial merge K → K_merged tokens
+    4. merger + deepstack — spatial merge + multi-scale feature concat
+
+    NOT independently verified end-to-end in this environment: the installed
+    vllm (0.26.0, this conda env) cannot load Qwen3VL at all here — importing
+    vllm.model_executor.models.qwen3_vl fails with "vllm.vllm_flash_attn
+    requires the CUDA flash attention extensions (_vllm_fa2_C or _vllm_fa3_C)",
+    which are not built for this environment/arch (aarch64, torch 2.13+cu130).
+    This rewrite was done by reading the installed vllm source directly (Read
+    tool, not import) and matching its exact API. Before trusting any
+    throughput/accuracy number from this path, run the numerical sanity check
+    from the plan this replaces: compare sparse_vit output embeddings against
+    dense on a small input where all patches are kept (should match near-
+    exactly) — in an environment where vLLM's CUDA kernels actually load
+    (e.g. the nvcr.io/nvidia/vllm:26.07-py3 container used for the original
+    batch_throughput_test_results.md benchmarks).
     """
     mask: torch.Tensor = payload["mask"]       # (T*H*W,) bool CPU
     K: int = payload["K"]
     T, H_vit, W_vit = payload["grid_thw"]
     total_vit = T * H_vit * W_vit
 
-    if not (hasattr(encoder, "patch_embed") and hasattr(encoder, "blocks")):
+    if not (hasattr(encoder, "patch_embed") and hasattr(encoder, "blocks")
+            and hasattr(encoder, "prepare_encoder_metadata")):
         print(
-            f"[SparseViT] {type(encoder).__name__} missing patch_embed/blocks — dense fallback.",
+            f"[SparseViT] {type(encoder).__name__} missing patch_embed/blocks/"
+            "prepare_encoder_metadata — dense fallback (unsupported architecture).",
             flush=True,
         )
         return original_forward(*args, **kwargs)
 
-    # Unpack positional args: (pixel_values/hidden_states, grid_thw)
+    # Unpack positional args: (pixel_values, grid_thw)
     if args:
         pixel_values = args[0]
         grid_thw_arg = args[1] if len(args) > 1 else kwargs.get("grid_thw")
     else:
-        pixel_values = kwargs.get("hidden_states") or kwargs.get("pixel_values")
+        pixel_values = kwargs.get("x") or kwargs.get("pixel_values")
         grid_thw_arg = kwargs.get("grid_thw")
 
     if pixel_values is None:
@@ -391,46 +437,29 @@ def _sparse_vit_forward(
 
     device = pixel_values.device
     mask = mask.to(device)
+    grid_thw_list = [[T, H_vit, W_vit]]
 
     # ── Step 1: Patch embedding (all N patches — cheap) ───────────────────────
-    hidden_states = encoder.patch_embed(pixel_values)  # (actual_total, D)
+    hidden_states = encoder.patch_embed(
+        pixel_values.to(device=device, dtype=encoder.dtype, non_blocking=True)
+    )  # (actual_total, D)
 
     actual_total = hidden_states.shape[0]
     if actual_total != total_vit:
-        # vLLM's actual frame count differs from context (off-by-one is common).
-        # Try to adapt: if patch size H×W matches, truncate or pad the mask.
-        patches_per_frame = H_vit * W_vit
-        if patches_per_frame > 0 and actual_total % patches_per_frame == 0:
-            T_actual = actual_total // patches_per_frame
-            if T_actual <= T:
-                # Truncate mask to first T_actual frames
-                mask = mask[: T_actual * patches_per_frame]
-                K = int(mask.sum().item())
-                T = T_actual
-                print(
-                    f"[SparseViT] Adapted mask: T {payload['grid_thw'][0]}→{T_actual} "
-                    f"({actual_total} patches, K={K})",
-                    flush=True,
-                )
-            else:
-                # More actual frames than mask — dense fallback
-                print(
-                    f"[SparseViT] T_actual={T_actual} > mask T={T}. Dense fallback.",
-                    flush=True,
-                )
-                return _dense_from_embedded(encoder, hidden_states, None, grid_thw_arg)
-        else:
-            print(
-                f"[SparseViT] Patch count mismatch: got {actual_total}, "
-                f"expected {total_vit} (T={T}×{H_vit}×{W_vit}). Dense fallback.",
-                flush=True,
-            )
-            return _dense_from_embedded(encoder, hidden_states, None, grid_thw_arg)
+        print(
+            f"[SparseViT] Patch count mismatch: got {actual_total}, "
+            f"expected {total_vit} (T={T}×{H_vit}×{W_vit}). Dense fallback.",
+            flush=True,
+        )
+        return _dense_from_embedded(encoder, hidden_states, grid_thw_arg or grid_thw_list)
 
-    # ── Step 2: Rotary position embeddings for all positions ──────────────────
-    rotary_pos_emb: Optional[torch.Tensor] = None
-    if hasattr(encoder, "rot_pos_emb") and grid_thw_arg is not None:
-        rotary_pos_emb = encoder.rot_pos_emb(grid_thw_arg)  # (total_vit, pos_dim) or (1, total_vit, ...)
+    # ── Step 2: Dense encoder metadata for the FULL grid (pos_embeds + rotary
+    #            cos/sin), computed via the model's own helper for correctness —
+    #            then gathered at the selected indices below. ──────────────────
+    dense_metadata = encoder.prepare_encoder_metadata(grid_thw_list)
+    pos_embeds = dense_metadata["pos_embeds"]                 # (total_vit, D)
+    rotary_cos = dense_metadata["rotary_pos_emb_cos"]          # (total_vit, pos_dim)
+    rotary_sin = dense_metadata["rotary_pos_emb_sin"]          # (total_vit, pos_dim)
 
     # ── Step 3: GATHER — select K of N patch embeddings (Task 2+3) ───────────
     selected_idx = mask.nonzero(as_tuple=False).view(-1)  # (K,)
@@ -440,46 +469,63 @@ def _sparse_vit_forward(
             f"[SparseViT] Mask gives {selected_idx.numel()} patches, expected K={K}. Dense fallback.",
             flush=True,
         )
-        return _dense_from_embedded(encoder, hidden_states, rotary_pos_emb, grid_thw_arg)
+        return _dense_from_embedded(encoder, hidden_states, grid_thw_list)
 
-    hidden_sparse = hidden_states[selected_idx]  # (K, D)
+    hidden_sparse = hidden_states[selected_idx]        # (K, D)
+    pos_embeds_sparse = pos_embeds[selected_idx]        # (K, D)
+    rotary_cos_sparse = rotary_cos[selected_idx]        # (K, pos_dim)
+    rotary_sin_sparse = rotary_sin[selected_idx]        # (K, pos_dim)
     print(
         f"[SparseViT] Gather: {actual_total} → {K} patches "
         f"({K / actual_total * 100:.1f}% retained before ViT blocks)",
         flush=True,
     )
 
-    # Gather rotary pos embeddings for selected indices
-    if rotary_pos_emb is not None:
-        if rotary_pos_emb.dim() == 2:
-            rotary_pos_emb_sparse = rotary_pos_emb[selected_idx]           # (K, pos_dim)
-        elif rotary_pos_emb.dim() == 3:
-            rotary_pos_emb_sparse = rotary_pos_emb[:, selected_idx, :]    # (1, K, pos_dim)
-        else:
-            rotary_pos_emb_sparse = None
-    else:
-        rotary_pos_emb_sparse = None
+    # ── Step 4: cu_seqlens/sequence_lengths/max_seqlen for the SPARSE per-frame
+    #            counts, via the same backend-specific helpers prepare_encoder_
+    #            metadata uses (MMEncoderAttention), not a hand-rolled cu_seqlens
+    #            — keeps this in sync with whatever attention backend is active. ─
+    from vllm.model_executor.layers.attention.mm_encoder_attention import (
+        MMEncoderAttention,
+    )
+    import numpy as np
 
-    # ── Step 4: cu_seqlens — recompute per-frame counts for flash-attn ────────
-    # After sparse selection each frame has a different number of patches,
-    # so we rebuild cumulative sequence lengths from the per-frame mask counts.
-    mask_per_frame = mask.view(T, H_vit * W_vit)                          # (T, H*W)
-    k_per_frame = mask_per_frame.sum(dim=1).to(torch.int32)               # (T,)
-    cu_seqlens = F.pad(k_per_frame.cumsum(0, dtype=torch.int32), (1, 0)) # (T+1,)
+    mask_per_frame = mask.view(T, H_vit * W_vit)                      # (T, H*W)
+    k_per_frame = mask_per_frame.sum(dim=1).cpu().numpy().astype(np.int32)  # (T,)
+    cu_seqlens_np = np.concatenate([[0], np.cumsum(k_per_frame)]).astype(np.int32)
+
+    sequence_lengths = MMEncoderAttention.maybe_compute_seq_lens(
+        encoder.attn_backend, cu_seqlens_np, device
+    )
+    max_seqlen_val = MMEncoderAttention.compute_max_seqlen(encoder.attn_backend, cu_seqlens_np)
+    cu_seqlens_sparse = MMEncoderAttention.maybe_recompute_cu_seqlens(
+        encoder.attn_backend, cu_seqlens_np, encoder.hidden_size, encoder.tp_size, device,
+        fp8_padded_hidden_size=encoder.fp8_padded_hidden_size,
+    )
+    sparse_metadata = {
+        "cu_seqlens": cu_seqlens_sparse,
+        "rotary_pos_emb_cos": rotary_cos_sparse,
+        "rotary_pos_emb_sin": rotary_sin_sparse,
+        "max_seqlen": torch.tensor(max_seqlen_val, dtype=torch.int32),
+        "sequence_lengths": sequence_lengths,
+    }
 
     # ── Step 5: Transformer blocks on K sparse patches (Task 3) ──────────────
-    hidden_sparse = _run_blocks(
-        encoder.blocks, hidden_sparse, cu_seqlens, rotary_pos_emb_sparse
+    hidden_sparse = hidden_sparse + pos_embeds_sparse
+    hidden_sparse = hidden_sparse.unsqueeze(1)
+    hidden_sparse, deepstack_feature_lists = _run_blocks_qwen3(
+        encoder.blocks, encoder.deepstack_visual_indexes, encoder.deepstack_merger_list,
+        hidden_sparse, sparse_metadata,
     )
 
-    # ── Step 6: Spatial merger: K patches → K_merged tokens ───────────────────
-    if hasattr(encoder, "merger"):
-        hidden_sparse = encoder.merger(hidden_sparse)
+    # ── Step 6: Spatial merger + deepstack concat: K patches → K_merged tokens ─
+    hidden_sparse = encoder.merger(hidden_sparse)
+    hidden_sparse = torch.cat([hidden_sparse] + deepstack_feature_lists, dim=1)
 
     K_merged = hidden_sparse.shape[0]
     print(
         f"[SparseViT] Output: {actual_total} patches → {K} sparse → {K_merged} merged tokens "
-        f"(vs dense {actual_total // 4} merged tokens)",
+        f"(vs dense {actual_total // (encoder.spatial_merge_unit)} merged tokens)",
         flush=True,
     )
     return hidden_sparse
@@ -581,7 +627,7 @@ def install_import_hook() -> None:
     import sys
 
     _TARGET_MODULES = {
-        "vllm.model_executor.models.qwen3_vl":   "Qwen2_5VLVisionTransformer",
+        "vllm.model_executor.models.qwen3_vl":   "Qwen3_VisionTransformer",
         "vllm.model_executor.models.qwen2_5_vl": "Qwen2_5VLVisionTransformer",
         "vllm.model_executor.models.qwen2_vl":   "Qwen2VLVisionTransformer",
     }

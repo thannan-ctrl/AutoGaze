@@ -34,7 +34,7 @@ def apply_autogaze_patch(mode: str = "magnitude") -> None:
         mode: One of:
             "evs"       — keep original EVS (cosine similarity) — baseline
             "magnitude" — magnitude-based proxy (no extra model)
-            "autogaze"  — full AutoGaze (requires AutoGazeContext with pre-computed mask)
+            "autogaze"  — sparse ViT pass-through (requires SparseViTContext + AutoGazeContext)
 
     Both hooks are patched for "magnitude" and "autogaze" modes:
       - compute_retention_mask      → selects which patches to keep
