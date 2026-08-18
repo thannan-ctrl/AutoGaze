@@ -14,9 +14,10 @@ sys.path.insert(0, REPO_DIR)
 
 MODEL_PATH = "nvidia/NVILA-8B-HD-Video"
 DEVICE = os.environ.get("NVILA_DEVICE", "cuda:0")
-DATA_DIR = os.path.join(REPO_DIR, "data", "egoschema")
-VIDEO_DIR = os.path.join(DATA_DIR, "videos")
-N_SAMPLES = int(os.environ.get("N_SAMPLES", "25"))
+DATA_DIR = os.path.join(REPO_DIR, "data")
+DATASET = os.environ.get("DATASET", "egoschema")  # "egoschema" | "video_mme"
+_n_samples_env = os.environ.get("N_SAMPLES", "25")
+N_SAMPLES = 0 if _n_samples_env.lower() == "full" else int(_n_samples_env)  # 0 = all usable items
 SEED = 0
 
 LETTERS = "ABCDE"

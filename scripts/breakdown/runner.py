@@ -1,4 +1,10 @@
-"""Per-question and per-mode benchmark loop."""
+"""Per-question and per-mode benchmark loop.
+
+Resumable: each result is appended to the output JSONL immediately (not
+buffered to end-of-run), and on startup any item_ids already present in an
+existing output file are loaded and skipped. Safe to kill and re-launch with
+the same command -- it picks up where it left off.
+"""
 import gc
 import json
 import os
@@ -9,14 +15,34 @@ import torch
 from . import config, dataset, processor, timing
 
 
+def output_path(mode: str) -> str:
+    return os.path.join(
+        config.REPO_DIR, "benchmark_results",
+        f"nvila_hd_accuracy_breakdown_{mode}_{config.DATASET}{config.result_suffix()}.jsonl",
+    )
+
+
+def load_done_ids(mode: str) -> dict:
+    """Returns {item_id: result_dict} for already-completed items."""
+    path = output_path(mode)
+    done = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                done[r["item_id"]] = r
+    return done
+
+
 def run_question(model, llm_call_state, proc, item: dict) -> dict:
-    q_uid = item["q_uid"]
-    video_path = os.path.join(config.VIDEO_DIR, f"{q_uid}.mp4")
     text = f"{proc.tokenizer.video_token}\n\n{dataset.build_prompt(item)}"
 
     timing.reset()
     t0 = time.time()
-    inputs = proc(text=text, videos=video_path, return_tensors="pt")
+    inputs = proc(text=text, videos=item["video_path"], return_tensors="pt")
     inputs = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
     num_tokens = inputs["input_ids"].shape[1]
     torch.cuda.synchronize()
@@ -44,12 +70,12 @@ def run_question(model, llm_call_state, proc, item: dict) -> dict:
         outputs[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
     )[0].strip()
     elapsed = time.time() - t0
-    pred = dataset.parse_letter(response)
+    pred = dataset.parse_letter(response, len(item["options"]))
 
     return {
-        "q_uid": q_uid,
+        "item_id": item["item_id"],
         "pred": dataset.LETTERS[pred] if pred >= 0 else None,
-        "answer": dataset.LETTERS[item["answer"]],
+        "answer": dataset.LETTERS[item["answer_idx"]],
         "preproc_ms": preproc_ms,
         "decode_ms": decode_ms,
         "image_preproc_ms": image_preproc_ms,
@@ -65,20 +91,20 @@ def run_question(model, llm_call_state, proc, item: dict) -> dict:
         "llm_ms": gen_timing["llm_prefill_ms"] + gen_timing["llm_decode_ms"],
         "llm_calls": gen_timing["llm_calls"],
         "e2e_ms": elapsed * 1000,
-        "correct": pred == item["answer"],
+        "correct": pred == item["answer_idx"],
         "raw_text": response,
         "num_tokens": num_tokens,
         "elapsed_s": elapsed,
     }
 
 
-def _log_result(mode: str, i: int, total: int, r: dict, correct: int) -> None:
+def _log_result(mode: str, i: int, total: int, r: dict, correct: int, n_scored: int) -> None:
     if "error" in r:
-        print(f"[{mode}] {i}/{total} q_uid={r['q_uid'][:8]} ERROR: {r['error']}", flush=True)
+        print(f"[{mode}] {i}/{total} id={r['item_id'][:12]} ERROR: {r['error']}", flush=True)
         return
     nf_note = f" nvf={r['num_video_frames_used']}" if mode == "dense" else ""
     print(
-        f"[{mode}] {i}/{total} q_uid={r['q_uid'][:8]} pred={r['pred']} "
+        f"[{mode}] {i}/{total} id={r['item_id'][:12]} pred={r['pred']} "
         f"answer={r['answer']} correct={r['correct']} tokens={r['num_tokens']}{nf_note} "
         f"e2e={r['elapsed_s']:.1f}s preproc={r['preproc_ms']:.0f}ms "
         f"[decode={r['decode_ms']:.0f} imgprep={r['image_preproc_ms']:.0f} "
@@ -86,7 +112,7 @@ def _log_result(mode: str, i: int, total: int, r: dict, correct: int) -> None:
         f"other={r['other_ms']:.0f} | cpu={r['cpu_ms']:.0f} gpu={r['gpu_ms']:.0f}]ms "
         f"vit={r['vit_ms']:.0f}ms llm={r['llm_ms']:.0f}ms"
         f"(prefill={r['llm_prefill_ms']:.0f}/decode={r['llm_decode_ms']:.0f}, {r['llm_calls']} calls) "
-        f"(running acc={correct}/{i}={correct/i:.1%})",
+        f"(running acc={correct}/{n_scored}={correct / max(n_scored, 1):.1%})",
         flush=True,
     )
 
@@ -95,48 +121,56 @@ def run_mode(mode: str, model, llm_call_state, samples: list) -> list:
     kw = {**config.COMMON_KW, **config.CONFIGS[mode]}
     print(f"\n[{mode}] kwargs: {kw}", flush=True)
 
+    done = load_done_ids(mode)
+    if done:
+        print(f"[{mode}] Resuming: {len(done)}/{len(samples)} items already done, skipping those.", flush=True)
+
     static_proc = processor.build(mode, kw["num_video_frames"]) if mode != "dense" else None
 
-    results, correct = [], 0
-    for i, item in enumerate(samples, start=1):
-        budgets = config.dense_frame_budgets() if mode == "dense" else [kw["num_video_frames"]]
-        r = None
-        for bi, nf in enumerate(budgets):
-            try:
-                proc = static_proc or processor.build(mode, nf)
-                r = run_question(model, llm_call_state, proc, item)
-                r["num_video_frames_used"] = nf
-                break
-            except torch.cuda.OutOfMemoryError as e:
-                gc.collect()
-                torch.cuda.empty_cache()
-                if bi == len(budgets) - 1:
-                    r = {"q_uid": item["q_uid"], "error": f"OOM at all frame budgets {budgets}: {str(e).splitlines()[0]}"}
-                else:
-                    print(
-                        f"[{mode}] {i}/{len(samples)} q_uid={item['q_uid'][:8]} OOM at "
-                        f"num_video_frames={nf}, retrying at {budgets[bi + 1]}",
-                        flush=True,
-                    )
-            except Exception as e:
-                r = {"q_uid": item["q_uid"], "error": str(e)}
-                break
-            finally:
-                torch.cuda.empty_cache()
+    out_path = output_path(mode)
+    results = [done[item["item_id"]] for item in samples if item["item_id"] in done]
+    correct = sum(1 for r in results if r.get("correct"))
+    n_scored = sum(1 for r in results if "error" not in r)
 
-        results.append(r)
-        if r.get("correct") is not None and "error" not in r:
-            correct += int(r["correct"])
-        _log_result(mode, i, len(samples), r, correct)
+    with open(out_path, "a") as out_f:
+        for item in samples:
+            if item["item_id"] in done:
+                continue
+            i = len(results) + 1
+            budgets = config.dense_frame_budgets() if mode == "dense" else [kw["num_video_frames"]]
+            r = None
+            for bi, nf in enumerate(budgets):
+                try:
+                    proc = static_proc or processor.build(mode, nf)
+                    r = run_question(model, llm_call_state, proc, item)
+                    r["num_video_frames_used"] = nf
+                    break
+                except torch.cuda.OutOfMemoryError as e:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    if bi == len(budgets) - 1:
+                        r = {"item_id": item["item_id"], "error": f"OOM at all frame budgets {budgets}: {str(e).splitlines()[0]}"}
+                    else:
+                        print(
+                            f"[{mode}] {i}/{len(samples)} id={item['item_id'][:12]} OOM at "
+                            f"num_video_frames={nf}, retrying at {budgets[bi + 1]}",
+                            flush=True,
+                        )
+                except Exception as e:
+                    r = {"item_id": item["item_id"], "error": str(e)}
+                    break
+                finally:
+                    torch.cuda.empty_cache()
 
-    print(f"\n[{mode}] Final accuracy: {correct}/{len(samples)} = {correct / len(samples):.1%}", flush=True)
+            results.append(r)
+            out_f.write(json.dumps(r) + "\n")
+            out_f.flush()
+            if "error" not in r:
+                n_scored += 1
+                correct += int(r["correct"])
+            _log_result(mode, i, len(samples), r, correct, n_scored)
 
-    out_path = os.path.join(
-        config.REPO_DIR, "benchmark_results", f"nvila_hd_accuracy_breakdown_{mode}{config.result_suffix()}.jsonl"
-    )
-    with open(out_path, "w") as f:
-        for r in results:
-            f.write(json.dumps(r) + "\n")
+    print(f"\n[{mode}] Final accuracy: {correct}/{n_scored} = {correct / max(n_scored, 1):.1%}", flush=True)
     print(f"[{mode}] Wrote {out_path}", flush=True)
 
     return results

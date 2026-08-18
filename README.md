@@ -12,8 +12,7 @@ Dense vs AutoGaze (chunked-batched, `MAX_BATCH_SIZE_AUTOGAZE=64`), 25 EgoSchema 
 
 ![Latency breakdown: Dense vs AutoGaze](assets/nvf16_summary_plots/latency_breakdown_dense_vs_autogaze.png)
 
-Dense's AutoGaze CPU ops are short-circuited (unused output — see "How to Run"); this is the
-already-fixed number.
+#### Deatailed Table:
 
 | | dense | autogaze (batched) |
 |---|---:|---:|
@@ -22,7 +21,7 @@ already-fixed number.
 | avg e2e | 4,915 ms | 8,257 ms |
 | decode (CPU) | 31 | 105 |
 | image_preproc (CPU) | 867 | 867 |
-| autogaze_ops (CPU) | ~0 (short-circuited) | 818 |
+| autogaze_ops (CPU) | 0 | 818 |
 | autogaze_model (GPU) | 0 | 6,007 |
 | other (CPU) | 69 | 5 |
 | vit (GPU) | 2,893 | 188 |
@@ -68,14 +67,26 @@ huggingface-cli download VLM2Vec/egoschema-rawvideo --repo-type dataset \
 `subset.json`/`questions.json` follow the official EgoSchema question format
 (github.com/egoschema/EgoSchema) — source them from there.
 
+### Models
+
+No manual download step — `nvidia/NVILA-8B-HD-Video` (~16.2GB) and `nvidia/AutoGaze` (tiny) are
+neither gated nor private, so `trust_remote_code=True` auto-downloads both from Hugging Face Hub
+on first run and caches them (`HF_HOME`, or `~/.cache/huggingface` by default). Requires internet
+access on first run; every run after that is offline/cached. No HF token/login needed.
+
 ### How to Run
 ```bash
 CUDA_VISIBLE_DEVICES=1 REPO_DIR=$(pwd) NVILA_DEVICE=cuda:0 \
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   FIXED_NUM_VIDEO_FRAMES=16 N_SAMPLES=25 MAX_BATCH_SIZE_AUTOGAZE=64 MODES=autogaze,dense \
+  DATASET=egoschema \
   python3 scripts/nvila_hd_accuracy_breakdown_test.py
 python3 scripts/plot_latency_breakdown.py
 ```
+
+`DATASET` selects `egoschema` or `video_mme` (VideoMME support and full-dataset/resumable runs
+were added after this README's numbers were generated — see `EXPERIMENT_LOG.md`/`RESTART.md` for
+that larger in-progress run). `N_SAMPLES` also accepts `full` to use every available item.
 
 `scripts/nvila_hd_accuracy_breakdown_test.py` monkey-patches the vendored (`trust_remote_code`)
 `NVILAProcessor` at runtime (no source edits) to split `preproc_ms` into `decode`, `image_preproc`,
@@ -85,5 +96,5 @@ tiles and thumbnails (dense mode) — safe because that output is never read in 
 
 ### Raw outputs
 
-- `benchmark_results/nvila_hd_accuracy_breakdown_{autogaze,dense}_nvf16.jsonl` — per-question
-- `benchmark_results/nvila_hd_accuracy_breakdown_summary_nvf16.json` — averaged summary
+- `benchmark_results/nvila_hd_accuracy_breakdown_{autogaze,dense}_egoschema_nvf16.jsonl` — per-question (this README's n=25 numbers)
+- `benchmark_results/nvila_hd_accuracy_breakdown_summary_egoschema_nvf16.json` — averaged summary
