@@ -1,0 +1,142 @@
+"""Per-question and per-mode benchmark loop."""
+import gc
+import json
+import os
+import time
+
+import torch
+
+from . import config, dataset, processor, timing
+
+
+def run_question(model, llm_call_state, proc, item: dict) -> dict:
+    q_uid = item["q_uid"]
+    video_path = os.path.join(config.VIDEO_DIR, f"{q_uid}.mp4")
+    text = f"{proc.tokenizer.video_token}\n\n{dataset.build_prompt(item)}"
+
+    timing.reset()
+    t0 = time.time()
+    inputs = proc(text=text, videos=video_path, return_tensors="pt")
+    inputs = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+    num_tokens = inputs["input_ids"].shape[1]
+    torch.cuda.synchronize()
+    preproc_ms = (time.time() - t0) * 1000
+    preproc_timing = timing.snapshot()
+
+    decode_ms = preproc_timing["decode_ms"]
+    image_preproc_ms = preproc_timing["preprocess_videos_total_ms"] - preproc_timing["autogaze_transform_ms"]
+    autogaze_ops_ms = preproc_timing["autogaze_transform_ms"] + max(
+        preproc_timing["gazing_info_total_ms"] - preproc_timing["autogaze_model_ms"], 0.0
+    )
+    autogaze_model_ms = preproc_timing["autogaze_model_ms"]
+    other_ms = max(preproc_ms - decode_ms - image_preproc_ms - autogaze_ops_ms - autogaze_model_ms, 0.0)
+
+    timing.reset()
+    llm_call_state["calls_since_reset"] = 0
+    gen_t0 = time.time()
+    with torch.inference_mode():
+        outputs = model.generate(**inputs, max_new_tokens=8)
+    torch.cuda.synchronize()
+    gen_ms = (time.time() - gen_t0) * 1000
+    gen_timing = timing.snapshot()
+
+    response = proc.batch_decode(
+        outputs[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
+    )[0].strip()
+    elapsed = time.time() - t0
+    pred = dataset.parse_letter(response)
+
+    return {
+        "q_uid": q_uid,
+        "pred": dataset.LETTERS[pred] if pred >= 0 else None,
+        "answer": dataset.LETTERS[item["answer"]],
+        "preproc_ms": preproc_ms,
+        "decode_ms": decode_ms,
+        "image_preproc_ms": image_preproc_ms,
+        "autogaze_ops_ms": autogaze_ops_ms,
+        "autogaze_model_ms": autogaze_model_ms,
+        "other_ms": other_ms,
+        "cpu_ms": decode_ms + image_preproc_ms + autogaze_ops_ms + other_ms,
+        "gpu_ms": autogaze_model_ms,
+        "generate_ms": gen_ms,
+        "vit_ms": gen_timing["vit_ms"],
+        "llm_prefill_ms": gen_timing["llm_prefill_ms"],
+        "llm_decode_ms": gen_timing["llm_decode_ms"],
+        "llm_ms": gen_timing["llm_prefill_ms"] + gen_timing["llm_decode_ms"],
+        "llm_calls": gen_timing["llm_calls"],
+        "e2e_ms": elapsed * 1000,
+        "correct": pred == item["answer"],
+        "raw_text": response,
+        "num_tokens": num_tokens,
+        "elapsed_s": elapsed,
+    }
+
+
+def _log_result(mode: str, i: int, total: int, r: dict, correct: int) -> None:
+    if "error" in r:
+        print(f"[{mode}] {i}/{total} q_uid={r['q_uid'][:8]} ERROR: {r['error']}", flush=True)
+        return
+    nf_note = f" nvf={r['num_video_frames_used']}" if mode == "dense" else ""
+    print(
+        f"[{mode}] {i}/{total} q_uid={r['q_uid'][:8]} pred={r['pred']} "
+        f"answer={r['answer']} correct={r['correct']} tokens={r['num_tokens']}{nf_note} "
+        f"e2e={r['elapsed_s']:.1f}s preproc={r['preproc_ms']:.0f}ms "
+        f"[decode={r['decode_ms']:.0f} imgprep={r['image_preproc_ms']:.0f} "
+        f"agops={r['autogaze_ops_ms']:.0f} agmodel={r['autogaze_model_ms']:.0f} "
+        f"other={r['other_ms']:.0f} | cpu={r['cpu_ms']:.0f} gpu={r['gpu_ms']:.0f}]ms "
+        f"vit={r['vit_ms']:.0f}ms llm={r['llm_ms']:.0f}ms"
+        f"(prefill={r['llm_prefill_ms']:.0f}/decode={r['llm_decode_ms']:.0f}, {r['llm_calls']} calls) "
+        f"(running acc={correct}/{i}={correct/i:.1%})",
+        flush=True,
+    )
+
+
+def run_mode(mode: str, model, llm_call_state, samples: list) -> list:
+    kw = {**config.COMMON_KW, **config.CONFIGS[mode]}
+    print(f"\n[{mode}] kwargs: {kw}", flush=True)
+
+    static_proc = processor.build(mode, kw["num_video_frames"]) if mode != "dense" else None
+
+    results, correct = [], 0
+    for i, item in enumerate(samples, start=1):
+        budgets = config.dense_frame_budgets() if mode == "dense" else [kw["num_video_frames"]]
+        r = None
+        for bi, nf in enumerate(budgets):
+            try:
+                proc = static_proc or processor.build(mode, nf)
+                r = run_question(model, llm_call_state, proc, item)
+                r["num_video_frames_used"] = nf
+                break
+            except torch.cuda.OutOfMemoryError as e:
+                gc.collect()
+                torch.cuda.empty_cache()
+                if bi == len(budgets) - 1:
+                    r = {"q_uid": item["q_uid"], "error": f"OOM at all frame budgets {budgets}: {str(e).splitlines()[0]}"}
+                else:
+                    print(
+                        f"[{mode}] {i}/{len(samples)} q_uid={item['q_uid'][:8]} OOM at "
+                        f"num_video_frames={nf}, retrying at {budgets[bi + 1]}",
+                        flush=True,
+                    )
+            except Exception as e:
+                r = {"q_uid": item["q_uid"], "error": str(e)}
+                break
+            finally:
+                torch.cuda.empty_cache()
+
+        results.append(r)
+        if r.get("correct") is not None and "error" not in r:
+            correct += int(r["correct"])
+        _log_result(mode, i, len(samples), r, correct)
+
+    print(f"\n[{mode}] Final accuracy: {correct}/{len(samples)} = {correct / len(samples):.1%}", flush=True)
+
+    out_path = os.path.join(
+        config.REPO_DIR, "benchmark_results", f"nvila_hd_accuracy_breakdown_{mode}{config.result_suffix()}.jsonl"
+    )
+    with open(out_path, "w") as f:
+        for r in results:
+            f.write(json.dumps(r) + "\n")
+    print(f"[{mode}] Wrote {out_path}", flush=True)
+
+    return results

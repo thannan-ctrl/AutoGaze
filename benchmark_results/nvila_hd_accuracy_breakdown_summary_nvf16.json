@@ -1,0 +1,42 @@
+{
+  "dense": {
+    "n": 25,
+    "correct": 13,
+    "accuracy": 0.52,
+    "avg_e2e_ms": 4914.773511886597,
+    "avg_preproc_ms": 972.2827339172363,
+    "avg_decode_ms": 30.81369400024414,
+    "avg_image_preproc_ms": 866.6222953796387,
+    "avg_autogaze_ops_ms": 6.322212219238281,
+    "avg_autogaze_model_ms": 0.0,
+    "avg_other_ms": 68.52453231811523,
+    "avg_cpu_ms": 972.2827339172363,
+    "avg_gpu_ms": 0.0,
+    "avg_vit_ms": 2893.2399034118653,
+    "avg_llm_ms": 997.3605136108398,
+    "avg_llm_prefill_ms": 871.56400390625,
+    "avg_llm_decode_ms": 125.79650970458984,
+    "avg_llm_calls": 2.44,
+    "avg_num_tokens": 24144.52
+  },
+  "autogaze": {
+    "n": 25,
+    "correct": 17,
+    "accuracy": 0.68,
+    "avg_e2e_ms": 8257.274055480957,
+    "avg_preproc_ms": 7802.143535614014,
+    "avg_decode_ms": 104.77898597717285,
+    "avg_image_preproc_ms": 867.2774314880371,
+    "avg_autogaze_ops_ms": 817.9604046630859,
+    "avg_autogaze_model_ms": 6006.66384765625,
+    "avg_other_ms": 5.462865829467773,
+    "avg_cpu_ms": 1795.4796879577636,
+    "avg_gpu_ms": 6006.66384765625,
+    "avg_vit_ms": 187.63439254760743,
+    "avg_llm_ms": 221.99025802612306,
+    "avg_llm_prefill_ms": 114.2094108581543,
+    "avg_llm_decode_ms": 107.78084716796874,
+    "avg_llm_calls": 2.36,
+    "avg_num_tokens": 1535.36
+  }
+}
