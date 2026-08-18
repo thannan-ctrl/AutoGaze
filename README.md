@@ -36,7 +36,39 @@ Dense vs AutoGaze (chunked-batched, `MAX_BATCH_SIZE_AUTOGAZE=64`), 25 EgoSchema 
    `prefill` 7x, but its 6s gazing-model cost outweighs those savings — AutoGaze is currently
    *slower* end-to-end (8.3s vs 4.9s).
 
+## Full-dataset results: EgoSchema (n=500) + VideoMME (n=1395)
 
+Same methodology as above, scaled up to the full EgoSchema subset and the locally-available
+VideoMME subset (see [Data](#data) for why VideoMME is 1395 of 2700 questions). Both datasets run
+mode-major (`MODES=autogaze,dense`), `N_SAMPLES=full`, otherwise identical settings.
+
+| | EgoSchema dense | EgoSchema autogaze | VideoMME dense | VideoMME autogaze |
+|---|---:|---:|---:|---:|
+| accuracy | 54.4% (272/500) | 60.4% (302/500) | 54.9% (766/1395) | 55.6% (775/1395) |
+| avg tokens to LLM | 23,784 | 1,598 | 28,318 | 1,526 |
+| avg e2e | 5,350 ms | 8,328 ms | 5,666 ms | 9,572 ms |
+| decode (CPU) | 67 | 110 | 52 | 54 |
+| image_preproc (CPU) | 884 | 868 | 934 | 1,059 |
+| autogaze_ops (CPU) | 9 | 822 | 4 | 1,060 |
+| autogaze_model (GPU) | 0 | 6,114 | 0 | 7,041 |
+| other (CPU) | 95 | 5 | 99 | 5 |
+| vit (GPU) | 3,325 | 166 | 3,472 | 146 |
+| llm_prefill (GPU) | 823 | 98 | 973 | 77 |
+| llm_decode (GPU) | 92 | 94 | 78 | 86 |
+
+Raw per-question data and averaged summaries: `benchmark_results/nvila_hd_accuracy_breakdown_{autogaze,dense}_{egoschema,video_mme}_nvf16.jsonl` / `..._summary_{egoschema,video_mme}_nvf16.json`. Full run log/status: `EXPERIMENT_LOG.md`.
+
+### Findings
+
+1. **Same qualitative pattern holds at full scale, on a second dataset.** AutoGaze wins accuracy
+   on both datasets (EgoSchema +6.0pp, VideoMME +0.6pp) and cuts LLM input tokens 15-19x, but is
+   net *slower* end-to-end on both at nvf=16 (EgoSchema 8.3s vs 5.4s, 1.56x; VideoMME 9.6s vs
+   5.7s, 1.69x).
+2. **The gazing model's own cost is the bottleneck, not the LLM/ViT savings.** `autogaze_model`
+   averages 6.1-7.0s across both datasets — more than the entire dense-mode pipeline (5.4-5.7s) —
+   so the 20-24x `vit` and 7-13x `prefill` savings it enables downstream don't close the gap.
+3. **VideoMME's accuracy gap is much smaller than EgoSchema's** (+0.6pp vs +6.0pp), suggesting
+   the accuracy benefit is dataset-dependent and not guaranteed to offset the latency cost.
 
 ### Installation
 
@@ -84,9 +116,34 @@ CUDA_VISIBLE_DEVICES=1 REPO_DIR=$(pwd) NVILA_DEVICE=cuda:0 \
 python3 scripts/plot_latency_breakdown.py
 ```
 
-`DATASET` selects `egoschema` or `video_mme` (VideoMME support and full-dataset/resumable runs
-were added after this README's numbers were generated — see `EXPERIMENT_LOG.md`/`RESTART.md` for
-that larger in-progress run). `N_SAMPLES` also accepts `full` to use every available item.
+`DATASET` selects `egoschema` or `video_mme`. `N_SAMPLES` also accepts `full` to use every
+available item — this is what was used for the [full-dataset results](#full-dataset-results-egoschema-n500--videomme-n1395)
+above:
+
+```bash
+conda activate auto_gaze
+cd /home/thannan/scratch/AutoGaze
+
+# EgoSchema (500 questions, the full answerable subset)
+CUDA_VISIBLE_DEVICES=<gpu> REPO_DIR=$(pwd) NVILA_DEVICE=cuda:0 \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  FIXED_NUM_VIDEO_FRAMES=16 N_SAMPLES=full MAX_BATCH_SIZE_AUTOGAZE=64 \
+  MODES=autogaze,dense DATASET=egoschema \
+  python3 scripts/nvila_hd_accuracy_breakdown_test.py
+
+# VideoMME (1395 questions -- only ones whose video is downloaded locally, see Data above)
+CUDA_VISIBLE_DEVICES=<gpu> REPO_DIR=$(pwd) NVILA_DEVICE=cuda:0 \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  FIXED_NUM_VIDEO_FRAMES=16 N_SAMPLES=full MAX_BATCH_SIZE_AUTOGAZE=64 \
+  MODES=autogaze,dense DATASET=video_mme \
+  python3 scripts/nvila_hd_accuracy_breakdown_test.py
+```
+
+Set `CUDA_VISIBLE_DEVICES` to a free GPU (check with `nvidia-smi`); run each dataset on a separate
+GPU if launching both at once. The runner is resumable — it skips any `item_id` already present
+in the output jsonl, so if an allocation dies mid-run (e.g. an `srun` wall-clock limit), just
+re-launch the same command. See `RESTART.md` for the full resume procedure and `EXPERIMENT_LOG.md`
+for this run's status/history.
 
 `scripts/nvila_hd_accuracy_breakdown_test.py` monkey-patches the vendored (`trust_remote_code`)
 `NVILAProcessor` at runtime (no source edits) to split `preproc_ms` into `decode`, `image_preproc`,

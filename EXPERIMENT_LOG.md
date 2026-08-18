@@ -38,16 +38,31 @@ not interleaved). Logs: `EXPERIMENT_LOG_egoschema.log`, `EXPERIMENT_LOG_video_mm
 
 ## Status table
 
-| Dataset | Mode | GPU | Target n | Progress (as of 07:34 UTC) | Status |
+| Dataset | Mode | GPU | Target n | Progress | Status |
 |---|---|---|---:|---:|---|
-| egoschema | autogaze | 1 | 500 | 270/500 | running |
-| egoschema | dense | 1 | 500 | 0/500 | pending -- starts after autogaze finishes, same GPU |
-| video_mme | autogaze | 2 | 1395 | 233/1395 | running |
-| video_mme | dense | 2 | 1395 | 0/1395 | pending -- unlikely to start this session |
+| egoschema | autogaze | 1 | 500 | 500/500 | **done** |
+| egoschema | dense | 1 | 500 | 500/500 | **done** |
+| video_mme | autogaze | 2 | 1395 | 1395/1395 | **done** |
+| video_mme | dense | 2 | 1395 | 1395/1395 | **done** |
 
-At ~4:52 elapsed / 3:08 left on job 1880436: EgoSchema on pace to finish (both modes) within
-the remaining window. VideoMME will not finish autogaze mode, let alone reach dense -- expect
-to resume per RESTART.md.
+**Run complete.** Job 1880436 (original launch) was killed by the 8h wall-clock limit after
+EgoSchema finished both modes. Resumed video_mme under job 1884278 per RESTART.md; autogaze
+picked up at 1366/1395 and finished immediately, dense mode then ran to completion.
+
+## Results summary
+
+| Dataset | Mode | n | Accuracy | Avg e2e latency | Avg tokens to LLM |
+|---|---|---:|---:|---:|---:|
+| egoschema | autogaze | 500 | 60.4% | 8328 ms | 1598 |
+| egoschema | dense | 500 | 54.4% | 5350 ms | 23784 |
+| video_mme | autogaze | 1395 | 55.6% | 9572 ms | 1526 |
+| video_mme | dense | 1395 | 54.9% | 5666 ms | 28318 |
+
+AutoGaze wins accuracy on both datasets (EgoSchema +6.0pp, VideoMME +0.6pp) and cuts tokens fed
+to the LLM by 15-19x, but is net **slower end-to-end** on both (EgoSchema 1.56x, VideoMME 1.69x)
+because the AutoGaze gazing-selection model itself (~6.1-7.0s avg) costs more than the
+LLM/ViT time it saves downstream. See per-dataset summary JSONs for full metric breakdowns:
+`benchmark_results/nvila_hd_accuracy_breakdown_summary_{egoschema,video_mme}_nvf16.json`.
 
 Update this table (and re-check `wc -l` on the jsonl files below) each time you check in.
 

@@ -1,0 +1,27 @@
+{
+  "enableAllProjectMcpServers": true,
+  "permissions": {
+    "allow": [
+      "mcp__dev-buddy__*",
+      "mcp__script-runner__*",
+      "mcp__slurm-buddy__*",
+      "Edit(mcp-servers/clusters.yaml)",
+      "Edit(*/.aa-jobs/*)"
+    ],
+    "deny": []
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/bash_guard.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

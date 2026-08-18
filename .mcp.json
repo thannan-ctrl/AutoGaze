@@ -1,0 +1,31 @@
+{
+  "mcpServers": {
+    "dev-buddy": {
+      "type": "stdio",
+      "command": "bash",
+      "args": [
+        "mcp-servers/_run_in_user_env.sh",
+        "python",
+        "mcp-servers/dev_buddy.py"
+      ]
+    },
+    "script-runner": {
+      "type": "stdio",
+      "command": "bash",
+      "args": [
+        "mcp-servers/_run_in_user_env.sh",
+        "python",
+        "mcp-servers/script_runner.py"
+      ]
+    },
+    "slurm-buddy": {
+      "type": "stdio",
+      "command": "bash",
+      "args": [
+        "mcp-servers/_run_in_user_env.sh",
+        "python",
+        "mcp-servers/slurm_buddy.py"
+      ]
+    }
+  }
+}

@@ -1,0 +1,3 @@
+mcp[cli]==1.26.0
+pytest
+pyyaml>=6.0
