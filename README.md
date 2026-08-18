@@ -39,8 +39,7 @@ Dense vs AutoGaze (chunked-batched, `MAX_BATCH_SIZE_AUTOGAZE=64`), 25 EgoSchema 
 ## Full-dataset results: EgoSchema (n=500) + VideoMME (n=1395)
 
 Same methodology as above, scaled up to the full EgoSchema subset and the locally-available
-VideoMME subset (see [Data](#data) for why VideoMME is 1395 of 2700 questions). Both datasets run
-mode-major (`MODES=autogaze,dense`), `N_SAMPLES=full`, otherwise identical settings.
+VideoMME subset (1395 of 2700 questions).
 
 | | EgoSchema dense | EgoSchema autogaze | VideoMME dense | VideoMME autogaze |
 |---|---:|---:|---:|---:|
@@ -56,19 +55,6 @@ mode-major (`MODES=autogaze,dense`), `N_SAMPLES=full`, otherwise identical setti
 | llm_prefill (GPU) | 823 | 98 | 973 | 77 |
 | llm_decode (GPU) | 92 | 94 | 78 | 86 |
 
-Raw per-question data and averaged summaries: `benchmark_results/nvila_hd_accuracy_breakdown_{autogaze,dense}_{egoschema,video_mme}_nvf16.jsonl` / `..._summary_{egoschema,video_mme}_nvf16.json`. Full run log/status: `EXPERIMENT_LOG.md`.
-
-### Findings
-
-1. **Same qualitative pattern holds at full scale, on a second dataset.** AutoGaze wins accuracy
-   on both datasets (EgoSchema +6.0pp, VideoMME +0.6pp) and cuts LLM input tokens 15-19x, but is
-   net *slower* end-to-end on both at nvf=16 (EgoSchema 8.3s vs 5.4s, 1.56x; VideoMME 9.6s vs
-   5.7s, 1.69x).
-2. **The gazing model's own cost is the bottleneck, not the LLM/ViT savings.** `autogaze_model`
-   averages 6.1-7.0s across both datasets — more than the entire dense-mode pipeline (5.4-5.7s) —
-   so the 20-24x `vit` and 7-13x `prefill` savings it enables downstream don't close the gap.
-3. **VideoMME's accuracy gap is much smaller than EgoSchema's** (+0.6pp vs +6.0pp), suggesting
-   the accuracy benefit is dataset-dependent and not guaranteed to offset the latency cost.
 
 ### Installation
 
@@ -103,8 +89,7 @@ huggingface-cli download VLM2Vec/egoschema-rawvideo --repo-type dataset \
 
 No manual download step — `nvidia/NVILA-8B-HD-Video` (~16.2GB) and `nvidia/AutoGaze` (tiny) are
 neither gated nor private, so `trust_remote_code=True` auto-downloads both from Hugging Face Hub
-on first run and caches them (`HF_HOME`, or `~/.cache/huggingface` by default). Requires internet
-access on first run; every run after that is offline/cached. No HF token/login needed.
+on first run and caches them (`HF_HOME`, or `~/.cache/huggingface` by default). 
 
 ### How to Run
 ```bash
@@ -139,11 +124,6 @@ CUDA_VISIBLE_DEVICES=<gpu> REPO_DIR=$(pwd) NVILA_DEVICE=cuda:0 \
   python3 scripts/nvila_hd_accuracy_breakdown_test.py
 ```
 
-Set `CUDA_VISIBLE_DEVICES` to a free GPU (check with `nvidia-smi`); run each dataset on a separate
-GPU if launching both at once. The runner is resumable — it skips any `item_id` already present
-in the output jsonl, so if an allocation dies mid-run (e.g. an `srun` wall-clock limit), just
-re-launch the same command. See `RESTART.md` for the full resume procedure and `EXPERIMENT_LOG.md`
-for this run's status/history.
 
 `scripts/nvila_hd_accuracy_breakdown_test.py` monkey-patches the vendored (`trust_remote_code`)
 `NVILAProcessor` at runtime (no source edits) to split `preproc_ms` into `decode`, `image_preproc`,
