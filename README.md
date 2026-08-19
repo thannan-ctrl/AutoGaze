@@ -10,7 +10,7 @@ Dense vs AutoGaze (chunked-batched, `MAX_BATCH_SIZE_AUTOGAZE=64`), 25 EgoSchema 
 
 ### Results (n=25, avg/question)
 
-![Latency breakdown: Dense vs AutoGaze](assets/nvf16_summary_plots/latency_breakdown_dense_vs_autogaze.png)
+<img src="assets/nvf16_summary_plots/latency_breakdown_dense_vs_autogaze.png" alt="AutoGaze student distillation proposal" width="800">
 
 #### Deatailed Table:
 
@@ -135,3 +135,13 @@ tiles and thumbnails (dense mode) — safe because that output is never read in 
 
 - `benchmark_results/nvila_hd_accuracy_breakdown_{autogaze,dense}_egoschema_nvf16.jsonl` — per-question (this README's n=25 numbers)
 - `benchmark_results/nvila_hd_accuracy_breakdown_summary_egoschema_nvf16.json` — averaged summary
+
+## Idea: Student Distillation for Faster AutoGaze
+
+The latency breakdown above shows AutoGaze's gazing model is the dominant cost, driven by its
+autoregressive, frame-by-frame decision process. One proposal to close that gap: distill a
+"student" model that consumes all frames in a single forward pass, trained to match the
+autoregressive model's per-frame decisions, trading the 16 sequential steps for 1.
+
+<img src="assets/nvf16_summary_plots/autogaze_student_distillation_proposal.png" alt="AutoGaze student distillation proposal" width="600">
+
