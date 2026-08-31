@@ -19,6 +19,8 @@ high) and keeps a fixed top-k per frame.
 
 ## N=500 (full), egoschema, nvf=16
 
+Source: [`benchmark_results/nvila_hd_accuracy_breakdown_summary_egoschema_nvf16.json`](benchmark_results/nvila_hd_accuracy_breakdown_summary_egoschema_nvf16.json)
+
 | Mode | Accuracy | avg e2e | avg selector cost | avg VLM cost | avg tokens |
 |---|---|---|---|---|---|
 | `codec` (scale=0.28) | 307/500 = 61.4% | 5,214ms | 3,927ms | 315ms | 1,572 |
@@ -26,6 +28,11 @@ high) and keeps a fixed top-k per frame.
 | `dense` (baseline) | 272/500 = 54.4% | 5,350ms | — | 4,294ms | 23,784 |
 
 ## N=1395 (full), videomme, nvf=16
+
+Source: [`benchmark_results/nvila_hd_accuracy_breakdown_summary_video_mme_nvf16.json`](benchmark_results/nvila_hd_accuracy_breakdown_summary_video_mme_nvf16.json)
+(`codec`'s cold/warm split is derived from the matching
+[`*_video_mme_nvf16.jsonl`](benchmark_results/nvila_hd_accuracy_breakdown_codec_video_mme_nvf16.jsonl),
+not stored in the summary directly — see the cold/warm caveat above).
 
 | Mode | Accuracy | avg e2e | avg selector cost | avg VLM cost | avg tokens |
 |---|---|---|---|---|---|
