@@ -11,5 +11,5 @@ def build(mode: str, num_video_frames: int):
     kw["num_video_frames_thumbnail"] = max(num_video_frames // 2, 1)
     kw["max_tiles_video"] = num_video_frames
     proc = AutoProcessor.from_pretrained(config.MODEL_PATH, trust_remote_code=True, **kw)
-    instrument(proc)
+    instrument(proc, mode=mode)
     return proc

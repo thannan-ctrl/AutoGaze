@@ -12,7 +12,7 @@ import time
 
 import torch
 
-from . import config, dataset, processor, timing
+from . import config, dataset, instrumentation, processor, timing
 
 
 def output_path(mode: str) -> str:
@@ -37,8 +37,11 @@ def load_done_ids(mode: str) -> dict:
     return done
 
 
-def run_question(model, llm_call_state, proc, item: dict) -> dict:
+def run_question(model, llm_call_state, proc, item: dict, mode: str = None) -> dict:
     text = f"{proc.tokenizer.video_token}\n\n{dataset.build_prompt(item)}"
+
+    if mode == "codec":
+        instrumentation.set_codec_video_context(item["video_path"])
 
     timing.reset()
     t0 = time.time()
@@ -142,7 +145,7 @@ def run_mode(mode: str, model, llm_call_state, samples: list) -> list:
             for bi, nf in enumerate(budgets):
                 try:
                     proc = static_proc or processor.build(mode, nf)
-                    r = run_question(model, llm_call_state, proc, item)
+                    r = run_question(model, llm_call_state, proc, item, mode=mode)
                     r["num_video_frames_used"] = nf
                     break
                 except torch.cuda.OutOfMemoryError as e:

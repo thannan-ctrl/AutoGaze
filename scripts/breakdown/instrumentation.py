@@ -13,6 +13,50 @@ from . import timing
 
 _processor_module_patched = False
 _skip_autogaze_transform_state = {"skip": False}
+_codec_state = {"enabled": False, "video_path": None}
+
+
+def set_codec_video_context(video_path: str) -> None:
+    """Called by runner.py right before `proc(...)` when mode == 'codec', so the
+    patched _get_gazing_info_from_videos knows which video to score. See
+    codec_selector.py and HEVC_Dump_Pipeline.md."""
+    _codec_state["video_path"] = video_path
+
+
+def _make_gazing_info_codec_override(orig_fn):
+    """When codec mode is active, bypass the real AutoGaze selector entirely and
+    substitute a codec-scored gazing_info dict for the single video set via
+    set_codec_video_context -- built independently from video_path (see
+    codec_selector.build_gazing_info), not from `videos_inputs` (which by this
+    point has lost the original video path / tile crop-box bookkeeping).
+
+    Reads num_video_frames/num_video_frames_thumbnail/max_tiles_video off the
+    processor instance itself (`self`), not from the caller's kwargs dict --
+    processor.build() mutates its own local copy of these per retry budget `nf`,
+    so `self.<attr>` is the only value guaranteed to match what
+    `_preprocess_videos` actually used for this exact call.
+    """
+    def overridden(self, videos_inputs):
+        if not _codec_state["enabled"]:
+            return orig_fn(self, videos_inputs)
+        from . import codec_selector
+
+        image_size = (
+            self.image_processor.size.get("height", 392) if hasattr(self.image_processor, "size") else 392
+        )
+        return codec_selector.build_gazing_info(
+            video_path=_codec_state["video_path"],
+            num_video_frames=self.num_video_frames,
+            num_video_frames_thumbnail=self.num_video_frames_thumbnail,
+            max_tiles_video=self.max_tiles_video,
+            autogaze_max_num_frames=self._autogaze_model.config.max_num_frames,
+            image_size=image_size,
+            scales=self.target_scales,
+            patch_size=self.target_patch_size,
+            gazing_ratio_tile=self.gazing_ratio_tile,
+            gazing_ratio_thumbnail=self.gazing_ratio_thumbnail,
+        )
+    return overridden
 
 
 def _make_transform_shortcircuit(orig_fn):
@@ -39,11 +83,11 @@ def _make_transform_shortcircuit(orig_fn):
     return shortcircuited
 
 
-def instrument(processor) -> None:
+def instrument(processor, mode: str | None = None) -> None:
     """Instrument a freshly-built NVILAProcessor instance: patch its class
     and module once (idempotent across instances, since they're re-imported
     from the same dynamically-loaded module), then wrap this instance's own
-    AutoGaze model and set the short-circuit flag from its config."""
+    AutoGaze model and set the short-circuit flags from its config / mode."""
     global _processor_module_patched
     cls = type(processor)
     proc_module = importlib.import_module(cls.__module__)
@@ -55,7 +99,7 @@ def instrument(processor) -> None:
         )
         cls._preprocess_videos = timing.wrap_cpu_time(cls._preprocess_videos, "preprocess_videos_total_ms")
         cls._get_gazing_info_from_videos = timing.wrap_cpu_time(
-            cls._get_gazing_info_from_videos, "gazing_info_total_ms"
+            _make_gazing_info_codec_override(cls._get_gazing_info_from_videos), "gazing_info_total_ms"
         )
         _processor_module_patched = True
 
@@ -66,4 +110,8 @@ def instrument(processor) -> None:
     skip_thumbs = cls._should_gaze_all_patches(
         processor.gazing_ratio_thumbnail, processor.task_loss_requirement_thumbnail
     )
-    _skip_autogaze_transform_state["skip"] = skip_tiles and skip_thumbs
+    _codec_state["enabled"] = mode == "codec"
+    # codec mode never reads pixel_values_videos_{tiles,thumbnails}_autogaze (it
+    # scores from the original video via codec_selector, not from these pixels),
+    # so the CPU transform producing them is dead work here too.
+    _skip_autogaze_transform_state["skip"] = (skip_tiles and skip_thumbs) or mode == "codec"
