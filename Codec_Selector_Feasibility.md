@@ -2,12 +2,20 @@
 
 `"codec"` mode (`scripts/breakdown`) vs. AutoGaze's trained selector, same base model
 (**NVILA-8B-HD-Video**). Token-count-matched via `CODEC_RATIO_SCALE=0.28`. Caches
-cleared before every run below except the videomme one (videomme has ~3
-questions/video, so most items there hit a legitimate warm cache — split into
-cold/warm rows).
+cleared before every run below except the videomme one (~3 questions/video, so most
+items there hit a legitimate warm cache — split into cold/warm rows).
 
 `avg selector cost` = `autogaze_ops_ms + autogaze_model_ms`. `avg VLM cost` =
 `avg_e2e_ms − avg_preproc_ms`. `avg tokens` = final `input_ids` length.
+
+## Concept
+
+`codec_selector.build_gazing_info()` is a drop-in substitute for AutoGaze's trained
+selector — same integration point, same output tensor schema. Instead of a trained
+autoregressive model, it scores HEVC coding units (small + motion-heavy + non-skip →
+high) and keeps a fixed top-k per frame.
+
+![From HEVC codec layout to AutoGaze patch indices](figures/codec_to_patches_diagram.svg)
 
 ## N=500 (full), egoschema, nvf=16
 
@@ -31,21 +39,9 @@ cold/warm rows).
 
 ## Reproducing
 
-Resumable — skips `item_id`s already in the output `.jsonl`. Delete a mode's `.jsonl`
-under `benchmark_results/` to force a clean re-run, and `data/hevc_dump_cache/*` for
-a genuinely-cold `codec` re-run.
-
 ```bash
-# GB200 nodes are aarch64 -- the x86_64 auto_gaze conda env won't run there.
 source /home/scratch.thannan_wwfo/miniforge-aarch64/etc/profile.d/conda.sh
-conda activate auto_gaze
-
-# One-time native build of hevc_dump for aarch64 (skip if
-# scripts/hevc_dump/cmake_build_aarch64/dump_stats already exists):
-#   cmake -S scripts/hevc_dump -B scripts/hevc_dump/cmake_build_aarch64 \
-#     -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_C_FLAGS=-fPIC -DCMAKE_CXX_FLAGS=-fPIC
-#   cmake --build scripts/hevc_dump/cmake_build_aarch64
-# codec_selector.py picks this build (vs. the x86_64 cmake_build) via platform.machine().
+conda activate auto_gaze  # GB200 = aarch64; build hevc_dump/cmake_build_aarch64 first if missing
 
 run() {  # $1=dataset $2=nvf
   rm -rf data/hevc_dump_cache/*
@@ -60,4 +56,3 @@ run video_mme 16
 
 # Results: benchmark_results/nvila_hd_accuracy_breakdown_summary_{egoschema,video_mme}_nvf16.json
 ```
-
