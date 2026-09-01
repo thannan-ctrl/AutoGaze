@@ -9,8 +9,10 @@ sbatch.sh
 *_ignored*
 wandb/
 hf_cache/
+hf_shim/
 videos/
 tools/
+nvila_hd_video_src/
 
 
 # Byte-compiled / optimized / DLL files

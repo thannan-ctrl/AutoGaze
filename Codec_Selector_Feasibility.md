@@ -27,6 +27,8 @@ Source: [`benchmark_results/nvila_hd_accuracy_breakdown_summary_egoschema_nvf16.
 | `autogaze` | 302/500 = 60.4% | 8,328ms | 6,936ms | 409ms | 1,598 |
 | `dense` (baseline) | 272/500 = 54.4% | 5,350ms | — | 4,294ms | 23,784 |
 
+![Latency breakdown by pipeline stage: Dense vs AutoGaze vs Codec](figures/latency_breakdown_dense_vs_autogaze_vs_codec.png)
+
 ## N=1395 (full), videomme, nvf=16
 
 Source: [`benchmark_results/nvila_hd_accuracy_breakdown_summary_video_mme_nvf16.json`](benchmark_results/nvila_hd_accuracy_breakdown_summary_video_mme_nvf16.json)
