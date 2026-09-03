@@ -33,6 +33,7 @@ from collections import defaultdict
 PRED_MODE, PART_MODE, QP, INTRA_PRED_MODE, MV_L0, MV_L1 = range(6)
 SKIP = 2
 MAX_CU_SIZE = 64  # HEVC max CTU side length
+NVDEC_CU_SIZE = 16  # NVDEC decode-stats grid (CUVIDDECODESTATS is per 16x16)
 
 
 def _rows_to_cus(rows):
@@ -93,6 +94,35 @@ def score_cu(cu, w_motion, skip_penalty):
     if cu.get("pred_mode") == SKIP:
         score *= skip_penalty
     return score
+
+
+def score_cu_grid(cu_type, mv0_x, mv0_y, mv1_x, mv1_y, w_motion, skip_penalty, cu_size=NVDEC_CU_SIZE):
+    """Vectorized `score_cu` for a regular `cu_size` x `cu_size` grid (NVDEC's
+    flattened 16x16 decode-stats layout). Arrays are (mh, mw); output is too.
+
+    Size term is constant on a regular grid (every cell has the same area), so
+    ranking within a frame is motion + skip only -- same formula as `score_cu`,
+    just no per-CU partition geometry.
+    """
+    import numpy as np
+
+    size_score = 1.0 - min(cu_size * cu_size, MAX_CU_SIZE**2) / (MAX_CU_SIZE**2)
+    mv0 = np.hypot(np.asarray(mv0_x, dtype=np.float64), np.asarray(mv0_y, dtype=np.float64))
+    mv1 = np.hypot(np.asarray(mv1_x, dtype=np.float64), np.asarray(mv1_y, dtype=np.float64))
+    motion_score = w_motion * np.minimum(np.maximum(mv0, mv1) / 256.0, 1.0)
+    score = size_score + motion_score
+    return np.where(np.asarray(cu_type) == SKIP, score * skip_penalty, score)
+
+
+def upsample_cu_grid(grid, frame_w, frame_h, cu_size=NVDEC_CU_SIZE):
+    """Nearest-neighbor expand a (mh, mw) CU-grid score map to (frame_h, frame_w)
+    pixels, matching `build_frame_score_map` painting each CU as a solid rectangle.
+    Cropped to the picture size so right/bottom edge cells that overhang (when
+    width/height aren't multiples of `cu_size`) don't extend past the frame."""
+    import numpy as np
+
+    up = np.repeat(np.repeat(np.asarray(grid, dtype=np.float64), cu_size, axis=0), cu_size, axis=1)
+    return up[:frame_h, :frame_w]
 
 
 def pool_score_map(score_map, grid_size):
@@ -216,6 +246,24 @@ def rasterize_multiscale_from_map(score_map, box_x0, box_y0, box_w, box_h, scale
         flat[offset:offset + g * g] = pool_score_map(canvas, g).flatten()
         offset += g * g
     return flat
+
+
+def rasterize_multiscale_from_cu_grid(
+    grid, box_x0, box_y0, box_w, box_h, scales, patch_size, cu_size=NVDEC_CU_SIZE
+):
+    """Token scores from an NVDEC 16x16 score grid.
+
+    `grid` is (mh, mw) in CU-cell space (native pixels / `cu_size`). Pixel crop
+    boxes are converted to that space so we never expand to frame resolution:
+    nearest-neighbor onto the AutoGaze canvas, then the same area-pool pyramid
+    as `rasterize_multiscale_from_map`. Tile edges that fall inside a 16x16 cell
+    snap to cell indices (same as `crop_and_resize_map`); they are not
+    area-weighted sub-cell crops.
+    """
+    s = float(cu_size)
+    return rasterize_multiscale_from_map(
+        grid, box_x0 / s, box_y0 / s, box_w / s, box_h / s, scales, patch_size
+    )
 
 
 def convert(csv_path, frame_w, frame_h, grid_size, w_motion, skip_penalty, topk):

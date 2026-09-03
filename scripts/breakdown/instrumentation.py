@@ -13,14 +13,15 @@ from . import timing
 
 _processor_module_patched = False
 _skip_autogaze_transform_state = {"skip": False}
-_codec_state = {"enabled": False, "video_path": None}
+_codec_state = {"enabled": False, "video_path": None, "backend": "libde265"}
 
 
-def set_codec_video_context(video_path: str) -> None:
-    """Called by runner.py right before `proc(...)` when mode == 'codec', so the
-    patched _get_gazing_info_from_videos knows which video to score. See
-    codec_selector.py and HEVC_Dump_Pipeline.md."""
+def set_codec_video_context(video_path: str, backend: str = "libde265") -> None:
+    """Called by runner.py right before `proc(...)` for codec modes, so the
+    patched _get_gazing_info_from_videos knows which video to score and which
+    dump backend to use. See codec_selector.py."""
     _codec_state["video_path"] = video_path
+    _codec_state["backend"] = backend
 
 
 def _make_gazing_info_codec_override(orig_fn):
@@ -55,6 +56,7 @@ def _make_gazing_info_codec_override(orig_fn):
             patch_size=self.target_patch_size,
             gazing_ratio_tile=self.gazing_ratio_tile,
             gazing_ratio_thumbnail=self.gazing_ratio_thumbnail,
+            backend=_codec_state["backend"],
         )
     return overridden
 
@@ -110,8 +112,11 @@ def instrument(processor, mode: str | None = None) -> None:
     skip_thumbs = cls._should_gaze_all_patches(
         processor.gazing_ratio_thumbnail, processor.task_loss_requirement_thumbnail
     )
-    _codec_state["enabled"] = mode == "codec"
-    # codec mode never reads pixel_values_videos_{tiles,thumbnails}_autogaze (it
-    # scores from the original video via codec_selector, not from these pixels),
+    from . import codec_selector
+    backend = codec_selector.BACKEND_FOR_MODE.get(mode)
+    _codec_state["enabled"] = backend is not None
+    _codec_state["backend"] = backend or "libde265"
+    # codec modes never read pixel_values_videos_{tiles,thumbnails}_autogaze (they
+    # score from the original video via codec_selector, not from these pixels),
     # so the CPU transform producing them is dead work here too.
-    _skip_autogaze_transform_state["skip"] = (skip_tiles and skip_thumbs) or mode == "codec"
+    _skip_autogaze_transform_state["skip"] = (skip_tiles and skip_thumbs) or _codec_state["enabled"]

@@ -1,5 +1,6 @@
 """Codec-based (HEVC CU partition/motion) substitute for AutoGaze's autoregressive
-selector, wired into the scripts/breakdown benchmark as mode "codec".
+selector, wired into the scripts/breakdown benchmark as modes "codec" and
+"codec_nvdec".
 
 Rather than intercepting NVILAProcessor mid-pipeline (crop-box bookkeeping isn't
 retained by the time `_get_gazing_info_from_videos` runs), this module independently
@@ -19,6 +20,17 @@ frames actually scored. Since we now choose exactly which real frame maps to whi
 artificial-stream POC (`poc_map`), the old "does POC == cv2-frame-index" assumption
 this module used to carry is no longer a risk -- the mapping is explicit and correct
 by construction rather than assumed.
+
+Backends:
+  libde265 ("codec")     -- dump_stats walks the true CU quad-tree, writes a
+                            YUView CSV, then we grep/parse it back. Ground truth
+                            partition geometry, slow plumbing.
+  nvdec ("codec_nvdec")  -- same windowed x265 Annex-B encode, then sequential
+                            NVDEC decode-stats (CreateDemuxer + CreateDecoder)
+                            on a regular 16x16 grid, kept as in-memory numpy
+                            (cached as .npz). Scores and token selection stay
+                            on that grid (pixel crop boxes are mapped into
+                            CU-cell space)
 """
 import functools
 import hashlib
@@ -36,6 +48,7 @@ _REPO_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 if _REPO_DIR not in sys.path:
     sys.path.insert(0, _REPO_DIR)
 from scripts import hevc_to_gaze as h2g  # noqa: E402
+from scripts import nvdec_dump as nvd  # noqa: E402
 
 # Two separate native builds exist -- cmake_build (x86_64, built on the login
 # node) and cmake_build_aarch64 (aarch64, built natively on GB200 compute
@@ -46,6 +59,11 @@ from scripts import hevc_to_gaze as h2g  # noqa: E402
 _BUILD_DIR = "cmake_build_aarch64" if platform.machine() == "aarch64" else "cmake_build"
 DUMP_STATS_BIN = os.path.join(_REPO_DIR, "scripts", "hevc_dump", _BUILD_DIR, "dump_stats")
 CACHE_DIR = os.path.join(_REPO_DIR, "data", "hevc_dump_cache")
+NVDEC_CACHE_DIR = os.path.join(_REPO_DIR, "data", "hevc_nvdec_cache")
+
+# Benchmark mode name -> dump backend. "codec" keeps the original libde265/CSV
+# path; "codec_nvdec" is the NVDEC 16x16 variant.
+BACKEND_FOR_MODE = {"codec": "libde265", "codec_nvdec": "nvdec"}
 
 
 def _video_key(video_path: str, frame_indices) -> str:
@@ -54,7 +72,7 @@ def _video_key(video_path: str, frame_indices) -> str:
     return hashlib.sha1(f"{video_path}:{st.st_size}:{st.st_mtime_ns}".encode()).hexdigest()[:16] + "_" + frames_key
 
 
-def _extract_and_encode_windows(video_path: str, frame_indices, hevc_path: str):
+def _extract_and_encode_windows(video_path: str, frame_indices, hevc_path: str, container: str = "hevc"):
     """Encode only small real-frame windows around each needed frame, not the
     whole video. For each target frame index, grabs it plus WINDOW real
     preceding frames (via a single sequential decode pass over the source --
@@ -64,6 +82,9 @@ def _extract_and_encode_windows(video_path: str, frame_indices, hevc_path: str):
     reliance on periodic `keyint` -- windows have variable length near the
     start of the video, so periodic keyint doesn't reliably land on window
     boundaries and can let motion data leak across windows).
+
+    `container` is the PyAV output format. Both dump backends consume Annex-B
+    (`hevc`); mp4 is not required.
 
     Returns (width, height, poc_map) where poc_map maps original cv2 frame
     index -> POC in the encoded stream (sequential 0..N-1 in window order).
@@ -89,7 +110,7 @@ def _extract_and_encode_windows(video_path: str, frame_indices, hevc_path: str):
         frame_i += 1
     src.close()
 
-    out = av.open(hevc_path, mode="w", format="hevc")
+    out = av.open(hevc_path, mode="w", format=container)
     enc = out.add_stream("libx265", rate=25)
     enc.width, enc.height = w, h
     enc.pix_fmt = "yuv420p"
@@ -153,6 +174,89 @@ def get_or_build_stats(video_path: str, frame_indices):
     return csv_path, w, h, poc_map
 
 
+def _gpu_id() -> int:
+    """Visible CUDA device index for PyNvVideoCodec. NVILA_DEVICE is already
+    the index *within* CUDA_VISIBLE_DEVICES (e.g. cuda:0), matching gpu_id=0
+    when the benchmark sets CUDA_VISIBLE_DEVICES to a single GPU."""
+    dev = os.environ.get("NVILA_DEVICE", "cuda:0")
+    if ":" in dev:
+        return int(dev.split(":")[-1])
+    return int(dev) if str(dev).isdigit() else 0
+
+
+def _nvdec_dump_grids(hevc_path: str, width: int, height: int):
+    """Decode `hevc_path` sequentially with NVDEC and return per-display-frame
+    dicts {cu_type, mv0_x, mv0_y, mv1_x, mv1_y}, each (mh, mw). Pixels are
+    discarded -- only the decode-stats buffer is kept."""
+    return nvd.dump_nvdec_grids(hevc_path, width, height, gpu_id=_gpu_id())
+
+
+def get_or_build_nvdec_stats(video_path: str, frame_indices):
+    """Windowed-encode then NVDEC-dump to a cached .npz of 16x16 grids.
+
+    Returns (npz_path, width, height, poc_map). The npz stores raw cu_type/MVs
+    (not scored maps) so w_motion/skip_penalty stay runtime parameters, matching
+    how the CSV backend defers scoring until parse time.
+    """
+    os.makedirs(NVDEC_CACHE_DIR, exist_ok=True)
+    key = _video_key(video_path, frame_indices)
+    npz_path = os.path.join(NVDEC_CACHE_DIR, f"{key}.npz")
+    if os.path.exists(npz_path):
+        w, h, poc_map, _n = _nvdec_npz_meta(npz_path)
+        return npz_path, w, h, poc_map
+
+    hevc_path = os.path.join(NVDEC_CACHE_DIR, f"{key}.hevc")
+    w, h, poc_map = _extract_and_encode_windows(video_path, frame_indices, hevc_path)
+    try:
+        grids = _nvdec_dump_grids(hevc_path, w, h)
+    finally:
+        if os.path.exists(hevc_path):
+            os.remove(hevc_path)
+
+    n_expected = (max(poc_map.values()) + 1) if poc_map else 0
+    if len(grids) != n_expected:
+        raise RuntimeError(
+            f"NVDEC decoded {len(grids)} frames from windowed stream, expected {n_expected} "
+            f"(display-order POCs 0..{n_expected - 1})"
+        )
+
+    np.savez_compressed(
+        npz_path,
+        width=np.int32(w),
+        height=np.int32(h),
+        poc_real=np.array(list(poc_map.keys()), dtype=np.int32),
+        poc_stream=np.array(list(poc_map.values()), dtype=np.int32),
+        cu_type=np.stack([g["cu_type"] for g in grids]),
+        mv0_x=np.stack([g["mv0_x"] for g in grids]),
+        mv0_y=np.stack([g["mv0_y"] for g in grids]),
+        mv1_x=np.stack([g["mv1_x"] for g in grids]),
+        mv1_y=np.stack([g["mv1_y"] for g in grids]),
+    )
+    return npz_path, w, h, poc_map
+
+
+@functools.lru_cache(maxsize=8)
+def _nvdec_npz_meta(npz_path: str):
+    with np.load(npz_path) as data:
+        w, h = int(data["width"]), int(data["height"])
+        poc_pairs = zip(data["poc_real"].tolist(), data["poc_stream"].tolist())
+        n = int(data["cu_type"].shape[0])
+    return w, h, dict(poc_pairs), n
+
+
+@functools.lru_cache(maxsize=8)
+def _load_nvdec_npz(npz_path: str):
+    """Keep the raw 16x16 stacks in process memory (same role as _cached_by_poc)."""
+    with np.load(npz_path) as data:
+        return {
+            "cu_type": np.asarray(data["cu_type"]),
+            "mv0_x": np.asarray(data["mv0_x"]),
+            "mv0_y": np.asarray(data["mv0_y"]),
+            "mv1_x": np.asarray(data["mv1_x"]),
+            "mv1_y": np.asarray(data["mv1_y"]),
+        }
+
+
 @functools.lru_cache(maxsize=8)
 def _cached_by_poc(csv_path: str, pocs: tuple, w_motion: float, skip_penalty: float):
     """Parse only the needed POCs' rows out of a hevc_dump CSV once per process,
@@ -180,6 +284,19 @@ def _cached_frame_score_map(csv_path: str, poc: int, pocs: tuple, w_motion: floa
     the frame's CU list (and repainting a canvas from scratch) once per tile."""
     by_poc = _cached_by_poc(csv_path, pocs, w_motion, skip_penalty)
     return h2g.build_frame_score_map(by_poc.get(poc, []), orig_w, orig_h)
+
+
+@functools.lru_cache(maxsize=1024)
+def _cached_nvdec_cu_scores(npz_path: str, poc: int, w_motion: float, skip_penalty: float):
+    """Per-frame 16x16 score grid (not upsampled). Token rasterization maps
+    pixel crop boxes into this CU-cell space."""
+    packed = _load_nvdec_npz(npz_path)
+    return h2g.score_cu_grid(
+        packed["cu_type"][poc],
+        packed["mv0_x"][poc], packed["mv0_y"][poc],
+        packed["mv1_x"][poc], packed["mv1_y"][poc],
+        w_motion, skip_penalty,
+    )
 
 
 def _sampled_frame_indices(video_path: str, num_frames: int):
@@ -225,6 +342,7 @@ def build_gazing_info(
     gazing_ratio_thumbnail,
     w_motion: float = 1.0,
     skip_penalty: float = 0.1,
+    backend: str = "libde265",
 ):
     """Build a codec-scored gazing_info dict for one video, matching the schema
     NVILAProcessor._get_gazing_info_from_videos produces for a single video:
@@ -234,12 +352,34 @@ def build_gazing_info(
     Unlike the autoregressive selector (which can emit a variable, EOS-terminated
     count per frame), this always selects a fixed top-k = round(total_patches *
     ratio) per frame, so if_padded is always False -- there's no padding to signal.
+
+    `backend`: "libde265" (true CU tree via dump_stats CSV) or "nvdec"
+    (PyNvVideoCodec 16x16 decode-stats, no CSV).
     """
     find_closest_aspect_ratio = _find_closest_aspect_ratio_fn()
 
     frame_indices = _sampled_frame_indices(video_path, num_video_frames)
-    csv_path, orig_w, orig_h, poc_map = get_or_build_stats(video_path, frame_indices)
-    pocs = tuple(sorted(set(poc_map.values())))
+    if backend == "nvdec":
+        npz_path, orig_w, orig_h, poc_map = get_or_build_nvdec_stats(video_path, frame_indices)
+
+        def score_region(poc, box_x0, box_y0, box_w, box_h):
+            grid = _cached_nvdec_cu_scores(npz_path, poc, w_motion, skip_penalty)
+            return h2g.rasterize_multiscale_from_cu_grid(
+                grid, box_x0, box_y0, box_w, box_h, scales, patch_size
+            )
+    elif backend == "libde265":
+        csv_path, orig_w, orig_h, poc_map = get_or_build_stats(video_path, frame_indices)
+        pocs = tuple(sorted(set(poc_map.values())))
+
+        def score_region(poc, box_x0, box_y0, box_w, box_h):
+            score_map = _cached_frame_score_map(
+                csv_path, poc, pocs, w_motion, skip_penalty, orig_w, orig_h
+            )
+            return h2g.rasterize_multiscale_from_map(
+                score_map, box_x0, box_y0, box_w, box_h, scales, patch_size
+            )
+    else:
+        raise ValueError(f"unknown codec backend {backend!r} (expected 'libde265' or 'nvdec')")
 
     # --- replicate spatial tiling decision (processing_nvila.py::_preprocess_videos) ---
     aspect_ratio = orig_w / orig_h
@@ -268,10 +408,6 @@ def build_gazing_info(
 
     grid_sizes = [s // patch_size for s in scales]
     total_patches = sum(g * g for g in grid_sizes)
-
-    def score_region(poc, box_x0, box_y0, box_w, box_h):
-        score_map = _cached_frame_score_map(csv_path, poc, pocs, w_motion, skip_penalty, orig_w, orig_h)
-        return h2g.rasterize_multiscale_from_map(score_map, box_x0, box_y0, box_w, box_h, scales, patch_size)
 
     def topk_ratio(ratio, index):
         # NOTE: gazing_ratio_tile, when a list, is indexed by frame-WITHIN-tile

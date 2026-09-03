@@ -12,7 +12,7 @@ Dense vs AutoGaze (chunked-batched, `MAX_BATCH_SIZE_AUTOGAZE=64`), 25 EgoSchema 
 
 <img src="assets/nvf16_summary_plots/latency_breakdown_dense_vs_autogaze.png" alt="AutoGaze student distillation proposal" width="800">
 
-#### Deatailed Table:
+#### Detailed Table:
 
 | | dense | autogaze (batched) |
 |---|---:|---:|
@@ -54,6 +54,47 @@ VideoMME subset (1395 of 2700 questions).
 | vit (GPU) | 3,325 | 166 | 3,472 | 146 |
 | llm_prefill (GPU) | 823 | 98 | 973 | 77 |
 | llm_decode (GPU) | 92 | 94 | 78 | 86 |
+
+
+
+### NVDEC vs Software Codec Implementations
+The NVDEC hardware implementation provides a significant speed-up over a naive software decoder, but requires an NVDEC core, driver version >= 610 and CUDA >=13.1 (https://docs.nvidia.com/video-technologies/video-codec-sdk/13.1/read-me/index.html#:~:text=or%20higher%20Toolkit-,Linux,CUDA%2013.1%20or%20higher%20Toolkit,-Jetson%20Linux). 
+Profiling on a 1080x1920, 130-frame sequence to compare runtimes of the two codec implementations. Note, CreateDemuxer, CreateDecoder, and teardown are largely fixed runtimes regardless of the number of frames decoded, so while NVDEC is asymptotically >100x faster, the actual speedup depends on number of frames decoded.
+
+#### "codec" (original implementation)
+```
+phase                       mean_ms   std_ms  min_ms    max_ms    n
+--------------------------  --------  ------  --------  --------  -
+decode+dump_stats           13457.75  18.80   13441.91  13489.33  5
+grep+parse CSV              5545.86   95.01   5454.78   5668.78   5
+score_cu + paint maps       1198.81   13.41   1180.09   1215.58   5
+TOTAL                       20227.67  109.75  20103.42  20363.25  5
+Speed: 155.6 ms/frame 
+```
+
+#### "codec_nvdec" (NVDEC-based implementation)
+```
+phase                    mean_ms  std_ms  min_ms  max_ms  n
+-----------------------  -------  ------  ------  ------  -
+CreateDemuxer            2.81     0.59    2.26    3.66    5
+CreateDecoder            57.24    2.24    55.94   61.18   5
+decode+parse_stats       158.42   12.45   151.03  180.08  5
+teardown                 58.38    2.79    56.19   63.05   5
+NVDEC dump grids         276.90   15.31   265.70  302.53  5
+score_cu_grid            12.22    0.21    11.99   12.53   5
+TOTAL                    289.12   15.52   277.69  315.06  5
+
+Speed: 2.224 ms/frame = (1.313 ms/frame + 118.43 ms )
+```
+
+However, NVDEC does not return the original partition structure, rather a grid of regularly-spaced 16x16pxl patches. This aligns more closely with AutoGaze, simplifying the required post-processing, but removes partition information especially useful for the first I-frame, where there are no motion vectors.
+
+![NVDEC dump frame 0](figures/nvdec/nvdec_dump_frame0.png)
+![NVDEC dump frame 1](figures/nvdec/nvdec_dump_frame1.png)
+
+
+Depending on the encoding configuration used (which we cannot impact with bitstreams from the wild), the dumped `qp_luma` could be used to derive confidence scores for these I-frames.
+![NVDEC dump frame 0 with CRF](figures/nvdec/nvdec_dump_frame0_crf.png)
 
 
 ### Installation
