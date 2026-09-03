@@ -70,6 +70,7 @@ CONFIGS = {
         task_loss_requirement_thumbnail=None,
     ),
 }
+CONFIGS["codec_nvdec"] = dict(CONFIGS["codec"])
 
 
 def dense_frame_budgets() -> list:

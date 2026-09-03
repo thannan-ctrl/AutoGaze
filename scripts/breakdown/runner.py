@@ -40,8 +40,9 @@ def load_done_ids(mode: str) -> dict:
 def run_question(model, llm_call_state, proc, item: dict, mode: str = None) -> dict:
     text = f"{proc.tokenizer.video_token}\n\n{dataset.build_prompt(item)}"
 
-    if mode == "codec":
-        instrumentation.set_codec_video_context(item["video_path"])
+    if mode in ("codec", "codec_nvdec"):
+        from . import codec_selector
+        instrumentation.set_codec_video_context(item["video_path"], backend=codec_selector.BACKEND_FOR_MODE[mode])
 
     timing.reset()
     t0 = time.time()
