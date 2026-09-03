@@ -65,3 +65,25 @@ run video_mme 16
 
 # Results: benchmark_results/nvila_hd_accuracy_breakdown_summary_{egoschema,video_mme}_nvf16.json
 ```
+
+## Integration: how `hevc_dump` is wired in
+
+`hevc_dump` ([gitlab-master.nvidia.com/seadie/hevc_dump](https://gitlab-master.nvidia.com/seadie/hevc_dump))
+is Sam's standalone ground-truth CU-stats dumper — it never talks to AutoGaze itself. Three pieces glue it in:
+
+1. **The switch** — `instrumentation.py:59-79` monkey-patches `NVILAProcessor._get_gazing_info_from_videos`
+   (the method that normally calls the real AutoGaze model). When codec mode is on, it calls
+   `codec_selector.build_gazing_info(...)` instead, which returns a dict shaped identically to AutoGaze's
+   own output — nothing downstream can tell them apart.
+2. **Encode** (README's `ffmpeg ... -c:v libx265 ...` step) — done in-process instead of via ffmpeg CLI:
+   `codec_selector.py::_extract_and_encode_windows()` uses `pyav` to encode only short per-frame windows
+   (not the whole video) into a fresh HEVC bitstream, forcing an I-frame at each window start.
+3. **Decode + dump** (README's `./cmake_build/dump_stats bitstream.hevc video.yuv stats.csv` step) — the
+   literal, direct call: `codec_selector.py::get_or_build_stats()`, `os.system(f'"{DUMP_STATS_BIN}"
+   "{hevc_path}" "{yuv_path}" "{csv_path}"')`. Same three positional args as the README example, just from
+   variables instead of typed literally. `DUMP_STATS_BIN` picks the arch-matching build
+   (`cmake_build`/`cmake_build_aarch64`) automatically.
+
+The resulting CSV is parsed and scored by `hevc_to_gaze.py` (`parse_csv_for_pocs` + `score_cu`) — **not**
+by `hevc_dump`'s own `hevc_autogaze.py` scorer; this repo reimplements CU→patch scoring independently
+(motion + CU-size + optional residual energy), it doesn't reuse Sam's geometric/ordinal splat scoring.
