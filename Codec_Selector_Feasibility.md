@@ -1,7 +1,6 @@
 # Codec-Based Patch Selection: A Feasibility Study
 
-> Part of the [AutoGaze](README.md) project — see the README for setup, installation,
-> and AutoGaze's own baseline latency breakdown.
+> See the [README](README.md) for setup, installation, and AutoGaze's own baseline latency breakdown.
 
 AutoGaze speeds up NVILA-HD-Video by feeding the LLM only the informative patches per
 frame, picked by a trained selector model. This tests a free substitute: HEVC encoding
