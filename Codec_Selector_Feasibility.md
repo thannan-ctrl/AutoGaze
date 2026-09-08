@@ -53,6 +53,22 @@ python3 scripts/visualize_codec_vs_autogaze_video.py --video <path.mp4> --out fi
 
 ### 2. Windowed vs. sampled-only: same accuracy, sampled-only is consistently faster
 
+Both variants inherit a limitation from AutoGaze itself: AutoGaze samples frames
+sparsely across the video, so neither variant ever scores genuinely consecutive real
+frames. Windowed decodes a few real frames of local context around each sampled point,
+but the sampled points themselves can still be seconds apart; sampled-only skips that
+context entirely and computes motion vectors directly between samples, treating
+far-apart frames as if adjacent. Neither matches what HEVC motion vectors are actually
+designed to measure — prediction between frames a fraction of a second apart, not
+whatever gap sparse sampling happens to leave.
+
+**LLaVA-OneVision-2** avoids this by not sampling at all: it scores saliency on *every*
+real frame of the compressed stream, with adaptive GOP boundaries that let frame
+allocation fall out of the motion signal instead of preceding it. It doesn't report
+compute/memory cost for that, though — it trains at up to 768 frames/10-15min without
+incident, which points our OOM wall more at this repo's `max_tiles_video` coupling bug
+than an inherent limit.
+
 <table>
 <tr>
 <td align="center"><b>Concept</b><br>
@@ -216,17 +232,6 @@ before any codec-mode run). Swap `DATASET=egoschema` for `DATASET=video_mme` to 
 other dataset. GIFs are downsampled previews — captions link the full-res video.
 
 </details>
-
-## Related Work: LLaVA-OneVision-2
-
-We sample frames first, then recover motion from the gaps. LLaVA-OneVision-2 skips
-sampling entirely — it scores saliency on *every* real frame of the compressed stream,
-with adaptive GOP boundaries that let frame allocation fall out of the motion signal
-instead of preceding it.
-
-Unaddressed: it never reports compute/memory cost. It does train at up to 768
-frames/10-15min without incident, though, which points our OOM wall more at this
-repo's `max_tiles_video` coupling bug than an inherent limit.
 
 ## Next Steps
 
