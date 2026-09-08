@@ -15,11 +15,16 @@ that instead of training anything.
 
 ### 1. At 16 frames, codec matches AutoGaze on accuracy and is faster end-to-end
 
-![AutoGaze vs. codec, EgoSchema](figures/codec_vs_autogaze_egoschema_comparison.gif)
-[EgoSchema, full-res](figures/codec_vs_autogaze_egoschema_comparison.mp4)
-
-![AutoGaze vs. codec, VideoMME](figures/codec_vs_autogaze_video_mme_comparison.gif)
-[VideoMME, full-res](figures/codec_vs_autogaze_video_mme_comparison.mp4)
+<table>
+<tr>
+<td align="center"><b>EgoSchema</b><br>
+<img src="figures/codec_vs_autogaze_egoschema_comparison.gif" width="360"><br>
+<a href="figures/codec_vs_autogaze_egoschema_comparison.mp4">full-res</a></td>
+<td align="center"><b>VideoMME</b><br>
+<img src="figures/codec_vs_autogaze_video_mme_comparison.gif" width="360"><br>
+<a href="figures/codec_vs_autogaze_video_mme_comparison.mp4">full-res</a></td>
+</tr>
+</table>
 
 | Mode | Accuracy | Total time | Selection time | LLM time | Tokens |
 |---|---|---|---|---|---|
@@ -48,10 +53,15 @@ python3 scripts/visualize_codec_vs_autogaze_video.py --video <path.mp4> --out fi
 
 ### 2. Windowed vs. sampled-only: same accuracy, sampled-only is consistently faster
 
-![Windowed vs. sampled-only concept](figures/windowed_vs_sampledonly_concept.png)
-
-![Windowed vs. sampled-only, same video](figures/windowed_vs_sampledonly_egoschema.gif)
-[Full-res](figures/windowed_vs_sampledonly_egoschema.mp4)
+<table>
+<tr>
+<td align="center"><b>Concept</b><br>
+<img src="figures/windowed_vs_sampledonly_concept.png" width="360"></td>
+<td align="center"><b>Same video, both variants</b><br>
+<img src="figures/windowed_vs_sampledonly_egoschema.gif" width="360"><br>
+<a href="figures/windowed_vs_sampledonly_egoschema.mp4">full-res</a></td>
+</tr>
+</table>
 
 | Frames | EgoSchema acc. | Windowed | Sampled-only | Δ | VideoMME acc. | Windowed | Sampled-only | Δ |
 |---|---|---|---|---|---|---|---|---|
@@ -93,20 +103,24 @@ done
 Restart encoding every 16 frames, keep full detail on each chunk's first frame — built
 up here in three steps: dense chunks, + anchor frame, + restart vs. real AutoGaze.
 
-![Whole video, dense 16-frame chunks](figures/full_video_codec_egoschema.gif)
-Dense chunks, 125 patches/frame. [Full-res](figures/full_video_codec_egoschema.mp4)
-
-![+ full-first-frame anchor per chunk](figures/full_video_codec_egoschema_fullfirstframe.gif)
-+ full-first-frame anchor, 1,038 patches at boundaries.
-[Full-res](figures/full_video_codec_egoschema_fullfirstframe.mp4)
-
-![VideoMME, full-first-frame, 20s crop](figures/full_video_codec_video_mme_fullfirstframe.gif)
-Same, VideoMME, ~20s crop (higher motion complexity caps duration).
-[Full-res](figures/full_video_codec_video_mme_fullfirstframe.mp4)
-
-![+ restart-coding/chunk vs. real AutoGaze](figures/restarted_chunks_vs_autogaze_egoschema.gif)
-+ restart every 16 frames, vs. real AutoGaze (constant 109 patches/frame).
-[Full-res](figures/restarted_chunks_vs_autogaze_egoschema.mp4)
+<table>
+<tr>
+<td align="center"><b>Dense chunks</b><br>
+<img src="figures/full_video_codec_egoschema.gif" width="360"><br>
+125 patches/frame · <a href="figures/full_video_codec_egoschema.mp4">full-res</a></td>
+<td align="center"><b>+ full-first-frame anchor</b><br>
+<img src="figures/full_video_codec_egoschema_fullfirstframe.gif" width="360"><br>
+1,038 patches at boundaries · <a href="figures/full_video_codec_egoschema_fullfirstframe.mp4">full-res</a></td>
+</tr>
+<tr>
+<td align="center"><b>Same, VideoMME (~20s crop)</b><br>
+<img src="figures/full_video_codec_video_mme_fullfirstframe.gif" width="360"><br>
+higher motion complexity caps duration · <a href="figures/full_video_codec_video_mme_fullfirstframe.mp4">full-res</a></td>
+<td align="center"><b>+ restart vs. real AutoGaze</b><br>
+<img src="figures/restarted_chunks_vs_autogaze_egoschema.gif" width="360"><br>
+AutoGaze constant at 109 patches/frame · <a href="figures/restarted_chunks_vs_autogaze_egoschema.mp4">full-res</a></td>
+</tr>
+</table>
 
 | Dataset | Sampled-only (128 frames) | + restart/anchor | Tokens |
 |---|---|---|---|
@@ -137,27 +151,12 @@ python3 scripts/visualize_restarted_chunks_vs_autogaze.py --video <path.mp4> --o
 
 ### 4. Isolating selection time alone (no ViT, no LLM)
 
-![EgoSchema selector-only latency](figures/selector_latency_egoschema.png)
-![VideoMME selector-only latency](figures/selector_latency_video_mme.png)
-
-| Frames | AutoGaze | Windowed | Sampled-only |
-|---|---|---|---|
-| **EgoSchema** | | | |
-| 16 | 7.7s | 5.1s | **3.4s** |
-| 32 | 16.3s | 10.2s | **6.6s** |
-| 64 | 34.5s | 21.0s | **13.6s** |
-| 128 | 67.6s | 41.2s | **26.3s** |
-| 256 | 326.6s | 124.5s | **87.8s** |
-| 512 | 223.2s | 281.1s | **177.0s** |
-| 1024 | **OOM** | 492.1s | **365.7s** |
-| **VideoMME** | | | |
-| 16 | 8.8s | 5.7s | **4.7s** |
-| 32 | 31.2s | 13.4s | **11.6s** |
-| 64 | 98.1s | 34.7s | **30.3s** |
-| 128 | 196.9s | 67.2s | **63.4s** |
-| 256 | 1239.6s | 363.5s | **344.2s** |
-| 512 | 2447.9s | **709.1s** | 711.7s |
-| 1024 | **OOM** | **OOM** | **1383.9s** |
+<table>
+<tr>
+<td align="center"><img src="figures/selector_latency_egoschema.png" width="360"></td>
+<td align="center"><img src="figures/selector_latency_video_mme.png" width="360"></td>
+</tr>
+</table>
 
 <details>
 <summary>Scaling rate and OOM root cause</summary>
