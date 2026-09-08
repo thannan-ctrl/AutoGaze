@@ -13,11 +13,6 @@ that instead of training anything.
 
 ## Results
 
-All commands below: `conda activate auto_gaze` first (GB200 = aarch64; build
-`hevc_dump/cmake_build_aarch64` before any codec-mode run). Swap `DATASET=egoschema`
-for `DATASET=video_mme` to run the other dataset. GIFs are downsampled previews —
-captions link the full-res video.
-
 ### 1. At 16 frames, codec matches AutoGaze on accuracy and is faster end-to-end
 
 ![AutoGaze vs. codec, EgoSchema](figures/codec_vs_autogaze_egoschema_comparison.gif)
@@ -213,6 +208,15 @@ decodes HEVC into a CSV of per-block motion/size/residual stats. `codec_selector
 encodes the sampled frames, runs `dump_stats`, and `hevc_to_gaze.py` scores each block
 and converts to AutoGaze's patch-index format. (`hevc_dump`'s own scorer,
 `hevc_autogaze.py`, is unused; `hevc_to_gaze.py` is independent.)
+
+<details>
+<summary>Setup for the commands throughout Results</summary>
+
+`conda activate auto_gaze` first (GB200 = aarch64; build `hevc_dump/cmake_build_aarch64`
+before any codec-mode run). Swap `DATASET=egoschema` for `DATASET=video_mme` to run the
+other dataset. GIFs are downsampled previews — captions link the full-res video.
+
+</details>
 
 ## Related Work: LLaVA-OneVision-2
 
