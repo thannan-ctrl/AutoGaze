@@ -81,7 +81,9 @@ nvf=16 unless noted — patch selection overlaid on the actual frames, not just 
   frame 0, no sparse sampling (constant 125 patches/frame)
 - **[+ full-first-frame anchor per chunk](figures/full_video_codec_egoschema_fullfirstframe.mp4)**
   — same, but every patch kept on each chunk's first frame (1,038 patches at chunk
-  boundaries); [VideoMME, 1.5min crop](figures/full_video_codec_video_mme_fullfirstframe.mp4)
+  boundaries); [VideoMME, ~20s crop](figures/full_video_codec_video_mme_fullfirstframe.mp4)
+  — this video's higher motion complexity OOMs the CU-level scoring cache at
+  anything longer, independent of frame count
 - **[+ restart-coding/chunk vs. real AutoGaze](figures/restarted_chunks_vs_autogaze_egoschema.mp4)**
   — codec restarted every 16 frames + full-first-frame anchor, run head-to-head against
   AutoGaze's real trained selector on the same video (AutoGaze holds constant at 109
