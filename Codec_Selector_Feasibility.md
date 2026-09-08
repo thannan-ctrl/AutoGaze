@@ -10,13 +10,10 @@
 
 **1. At 16 frames, codec matches AutoGaze on accuracy and is faster end-to-end:**
 
-Side by side, same video, same nvf — EgoSchema:
-
-<video src="figures/codec_vs_autogaze_egoschema_comparison.mp4" controls width="500"></video>
-
-VideoMME:
-
-<video src="figures/codec_vs_autogaze_video_mme_comparison.mp4" controls width="500"></video>
+Side by side, same video, same nvf:
+[EgoSchema](figures/codec_vs_autogaze_egoschema_comparison.mp4) ·
+[VideoMME](figures/codec_vs_autogaze_video_mme_comparison.mp4)
+(click through to GitHub's video player)
 
 | Mode | Accuracy | Total time | Selection time | LLM time | Tokens |
 |---|---|---|---|---|---|
@@ -80,29 +77,21 @@ over the edge; sampled-only's flat per-frame footprint doesn't.
 ## Videos
 
 nvf=16 unless noted — patch selection overlaid on the actual frames, not just numbers.
-(AutoGaze vs. codec side by side is under Finding 1, above.)
+(AutoGaze vs. codec side by side is under Finding 1, above. Click through to GitHub's
+video player; GitHub doesn't render inline players for repo-hosted files in markdown.)
 
-**Whole video, dense 16-frame chunks** — codec run the way AutoGaze's own
-QUICK_START.md prescribes: back-to-back chunks from frame 0, no sparse sampling
-(constant 125 patches/frame):
-
-<video src="figures/full_video_codec_egoschema.mp4" controls width="500"></video>
-
-**+ full-first-frame anchor per chunk** — same, but every patch kept on each chunk's
-first frame (1,038 patches at chunk boundaries):
-
-<video src="figures/full_video_codec_egoschema_fullfirstframe.mp4" controls width="500"></video>
-
-VideoMME, ~20s crop — this video's higher motion complexity OOMs the CU-level scoring
-cache at anything longer, independent of frame count:
-
-<video src="figures/full_video_codec_video_mme_fullfirstframe.mp4" controls width="500"></video>
-
-**+ restart-coding/chunk vs. real AutoGaze** — codec restarted every 16 frames +
-full-first-frame anchor, run head-to-head against AutoGaze's real trained selector on
-the same video (AutoGaze holds constant at 109 patches/frame):
-
-<video src="figures/restarted_chunks_vs_autogaze_egoschema.mp4" controls width="500"></video>
+- **[Whole video, dense 16-frame chunks](figures/full_video_codec_egoschema.mp4)** —
+  codec run the way AutoGaze's own QUICK_START.md prescribes: back-to-back chunks from
+  frame 0, no sparse sampling (constant 125 patches/frame)
+- **[+ full-first-frame anchor per chunk](figures/full_video_codec_egoschema_fullfirstframe.mp4)**
+  — same, but every patch kept on each chunk's first frame (1,038 patches at chunk
+  boundaries); [VideoMME, ~20s crop](figures/full_video_codec_video_mme_fullfirstframe.mp4)
+  — this video's higher motion complexity OOMs the CU-level scoring cache at
+  anything longer, independent of frame count
+- **[+ restart-coding/chunk vs. real AutoGaze](figures/restarted_chunks_vs_autogaze_egoschema.mp4)**
+  — codec restarted every 16 frames + full-first-frame anchor, run head-to-head against
+  AutoGaze's real trained selector on the same video (AutoGaze holds constant at 109
+  patches/frame)
 
 ## Reproducing
 
