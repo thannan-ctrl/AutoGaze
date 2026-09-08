@@ -1,20 +1,24 @@
-# Replace AutoGaze Autoregressive Token Selector with Codec Based Heuristic
+# Codec-Based Patch Selection: A Feasibility Study
+
+AutoGaze speeds up NVILA-HD-Video by feeding the LLM only the informative patches per
+frame, picked by a trained selector model. This tests a free substitute: HEVC encoding
+already computes a per-block motion vector during normal compression — threshold on
+that instead of training anything.
 
 ## Summary
 
-- Matches AutoGaze on accuracy and beats it on latency up to ~128 sampled frames
+- Matches AutoGaze on accuracy and beats it on latency up to ~128 sampled frames.
 - Above ~256 frames both hit scaling limits before the LLM does — at nvf=1024, only
-  codec's **sampled-only** survives; AutoGaze and codec-windowed hard-crash (OOM).
+  codec's **sampled-only** variant survives; AutoGaze and codec-windowed hard-crash (OOM).
 
 ## Results
 
 All commands below: `conda activate auto_gaze` first (GB200 = aarch64; build
 `hevc_dump/cmake_build_aarch64` before any codec-mode run). Swap `DATASET=egoschema`
-for `DATASET=video_mme` to run the other dataset.
+for `DATASET=video_mme` to run the other dataset. GIFs are downsampled previews —
+captions link the full-res video.
 
-**1. At 16 frames, codec matches AutoGaze on accuracy and is faster end-to-end:**
-
-GIFs are downsampled previews; captions link the full-res video.
+### 1. At 16 frames, codec matches AutoGaze on accuracy and is faster end-to-end
 
 ![AutoGaze vs. codec, EgoSchema](figures/codec_vs_autogaze_egoschema_comparison.gif)
 [EgoSchema, full-res](figures/codec_vs_autogaze_egoschema_comparison.mp4)
@@ -47,7 +51,7 @@ python3 scripts/visualize_codec_vs_autogaze_video.py --video <path.mp4> --out fi
 
 </details>
 
-**2. Windowed vs. sampled-only: same accuracy, sampled-only is consistently faster:**
+### 2. Windowed vs. sampled-only: same accuracy, sampled-only is consistently faster
 
 ![Windowed vs. sampled-only concept](figures/windowed_vs_sampledonly_concept.png)
 
@@ -89,10 +93,10 @@ done
 
 </details>
 
-**3. Matching AutoGaze's actual chunking (restart encoding every 16 frames, keep full
-detail on each chunk's first frame) did not help:**
+### 3. Matching AutoGaze's actual chunking did not help
 
-Building up to it — dense chunks, +anchor frame, +restart vs. real AutoGaze:
+Restart encoding every 16 frames, keep full detail on each chunk's first frame — built
+up here in three steps: dense chunks, + anchor frame, + restart vs. real AutoGaze.
 
 ![Whole video, dense 16-frame chunks](figures/full_video_codec_egoschema.gif)
 Dense chunks, 125 patches/frame. [Full-res](figures/full_video_codec_egoschema.mp4)
@@ -136,24 +140,41 @@ python3 scripts/visualize_restarted_chunks_vs_autogaze.py --video <path.mp4> --o
 
 </details>
 
-**4. Isolating selection time alone (no ViT, no LLM)**
+### 4. Isolating selection time alone (no ViT, no LLM)
 
 ![EgoSchema selector-only latency](figures/selector_latency_egoschema.png)
 ![VideoMME selector-only latency](figures/selector_latency_video_mme.png)
 
+| Frames | AutoGaze | Windowed | Sampled-only |
+|---|---|---|---|
+| **EgoSchema** | | | |
+| 16 | 7.7s | 5.1s | **3.4s** |
+| 32 | 16.3s | 10.2s | **6.6s** |
+| 64 | 34.5s | 21.0s | **13.6s** |
+| 128 | 67.6s | 41.2s | **26.3s** |
+| 256 | 326.6s | 124.5s | **87.8s** |
+| 512 | 223.2s | 281.1s | **177.0s** |
+| 1024 | **OOM** | 492.1s | **365.7s** |
+| **VideoMME** | | | |
+| 16 | 8.8s | 5.7s | **4.7s** |
+| 32 | 31.2s | 13.4s | **11.6s** |
+| 64 | 98.1s | 34.7s | **30.3s** |
+| 128 | 196.9s | 67.2s | **63.4s** |
+| 256 | 1239.6s | 363.5s | **344.2s** |
+| 512 | 2447.9s | **709.1s** | 711.7s |
+| 1024 | **OOM** | **OOM** | **1383.9s** |
+
 <details>
-<summary>Scaling numbers and nvf=1024 crash details</summary>
+<summary>Scaling rate and OOM root cause</summary>
 
-16→128 frames (8x): AutoGaze grows 8.8x (EgoSchema)/22.3x (VideoMME) vs. codec's
-12-14x — by 512 frames AutoGaze on VideoMME hits 2,448s/question, ~3x either codec
-variant (~750s).
+16→128 frames (8x): AutoGaze grows 8.8x (EgoSchema)/22.3x (VideoMME) vs. codec's 12-14x
+— clearly super-linear well before any crash.
 
-AutoGaze hard-crashes at nvf=1024 on **both** datasets; codec-windowed crashes there too
-on VideoMME (EgoSchema windowed survives) — all confirmed OOM kills (~985-987GB
-resident), reproduced 2-3/3 tries regardless of batch size. Only **sampled-only**
-finishes the full sweep on both datasets (419s EgoSchema, 1,384s VideoMME) — the extra
-real-frame context windowing and AutoGaze's own model both carry is what tips memory
-over the edge; sampled-only's flat per-frame footprint doesn't.
+All three OOMs are confirmed real host-RAM kills (~985-987GB resident), reproduced 2-3/3
+tries regardless of batch size — not a hang. Windowing's extra real-frame context and
+AutoGaze's own model both carry memory that scales with frame count; sampled-only's flat
+per-frame footprint doesn't, which is why it's the only variant that survives nvf=1024
+on both datasets.
 
 **Commands:**
 
@@ -188,26 +209,24 @@ intercepts NVILA-HD's `_get_gazing_info_from_videos` at the exact point AutoGaze
 selector runs and returns the same tensor shapes — no changes to NVILA-HD itself.
 
 Under the hood: [`hevc_dump`](https://gitlab-master.nvidia.com/seadie/hevc_dump)
-decodes HEVC into a CSV of per-block motion/size/residual stats.
-`codec_selector.py` encodes the sampled frames, runs `dump_stats`, and
-`hevc_to_gaze.py` scores each block and converts to AutoGaze's patch-index format.
-(`hevc_dump`'s own scorer, `hevc_autogaze.py`, is unused; `hevc_to_gaze.py` is
-independent.)
+decodes HEVC into a CSV of per-block motion/size/residual stats. `codec_selector.py`
+encodes the sampled frames, runs `dump_stats`, and `hevc_to_gaze.py` scores each block
+and converts to AutoGaze's patch-index format. (`hevc_dump`'s own scorer,
+`hevc_autogaze.py`, is unused; `hevc_to_gaze.py` is independent.)
 
-## Related Work: How LLaVA-OneVision-2 Handles This
+## Related Work: LLaVA-OneVision-2
 
-We sample frames first, then recover motion from the gaps. LLaVA-OneVision-2 skips sampling entirely: scores saliency on *every* real frame of
-the compressed stream, with adaptive GOP boundaries that let frame
-allocation fall out of the motion signal instead of preceding it.
+We sample frames first, then recover motion from the gaps. LLaVA-OneVision-2 skips
+sampling entirely — it scores saliency on *every* real frame of the compressed stream,
+with adaptive GOP boundaries that let frame allocation fall out of the motion signal
+instead of preceding it.
 
-Unaddressed: they never report compute/memory cost for this. They do train at up to
-768 frames/10-15min without incident, though, which points our OOM wall more at this
+Unaddressed: it never reports compute/memory cost. It does train at up to 768
+frames/10-15min without incident, though, which points our OOM wall more at this
 repo's `max_tiles_video` coupling bug than an inherent limit.
 
 ## Next Steps
 
-1. AutoGaze: Integrate NVDEC into codec mode.
-2. Implement LLaVA-OneVision-2's actual approach:
-   1. Profile its real latency — the paper never reports this.
-   2. Add NVDEC to that pipeline.
-
+1. Integrate NVDEC into codec mode.
+2. Implement LLaVA-OneVision-2's actual approach, then profile its real latency (the
+   paper never reports this) and add NVDEC to that pipeline too.
