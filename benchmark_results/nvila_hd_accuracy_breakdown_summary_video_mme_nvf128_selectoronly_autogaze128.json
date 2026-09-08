@@ -1,0 +1,22 @@
+{
+  "autogaze": {
+    "n": 25,
+    "correct": 0,
+    "accuracy": 0.0,
+    "avg_e2e_ms": 196911.8788412639,
+    "avg_preproc_ms": 196911.8788412639,
+    "avg_decode_ms": 235.24097033909388,
+    "avg_image_preproc_ms": 16780.301894460405,
+    "avg_autogaze_ops_ms": 20992.895473616463,
+    "avg_autogaze_model_ms": 158711.96754673548,
+    "avg_other_ms": 191.47295611245292,
+    "avg_cpu_ms": 38199.911294528414,
+    "avg_gpu_ms": 158711.96754673548,
+    "avg_vit_ms": 0.0,
+    "avg_llm_ms": 0.0,
+    "avg_llm_prefill_ms": 0.0,
+    "avg_llm_decode_ms": 0.0,
+    "avg_llm_calls": 0.0,
+    "avg_num_tokens": 17027.571428571428
+  }
+}

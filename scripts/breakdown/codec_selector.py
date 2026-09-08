@@ -48,10 +48,16 @@ DUMP_STATS_BIN = os.path.join(_REPO_DIR, "scripts", "hevc_dump", _BUILD_DIR, "du
 CACHE_DIR = os.path.join(_REPO_DIR, "data", "hevc_dump_cache")
 
 
-def _video_key(video_path: str, frame_indices) -> str:
+def _video_key(video_path: str, frame_indices, sampled_only: bool = False, gop_restart: int | None = None) -> str:
     st = os.stat(video_path)
     frames_key = hashlib.sha1(str(sorted(set(frame_indices))).encode()).hexdigest()[:8]
-    return hashlib.sha1(f"{video_path}:{st.st_size}:{st.st_mtime_ns}".encode()).hexdigest()[:16] + "_" + frames_key
+    # sampled_only/gop_restart must be part of the key -- each changes what's
+    # encoded for the SAME (video_path, frame_indices), so a shared key would
+    # let one mode silently serve another's cached CSV.
+    suffix = "_so" if sampled_only else ""
+    if gop_restart:
+        suffix += f"_gop{gop_restart}"
+    return hashlib.sha1(f"{video_path}:{st.st_size}:{st.st_mtime_ns}".encode()).hexdigest()[:16] + "_" + frames_key + suffix
 
 
 def _extract_and_encode_windows(video_path: str, frame_indices, hevc_path: str):
@@ -120,12 +126,133 @@ def _extract_and_encode_windows(video_path: str, frame_indices, hevc_path: str):
     return w, h, poc_map
 
 
-def get_or_build_stats(video_path: str, frame_indices):
+def _encode_sampled_frames_only(video_path: str, frame_indices, hevc_path: str):
+    """Encode ONLY the exact sampled frames, chained into one continuous stream
+    -- no real-frame context window. The first sampled frame is forced I; every
+    subsequent sampled frame is left as a natural P-frame, so x265's own motion
+    estimation computes MVs between CONSECUTIVE SAMPLED FRAMES directly --
+    however far apart they actually are in the source video's real timeline --
+    rather than from genuinely-adjacent real frames like
+    `_extract_and_encode_windows` does.
+
+    This is an ablation/speed variant: it skips decoding/encoding the WINDOW
+    real context frames per sampled point entirely (the dominant cost of the
+    windowed approach at high frame counts -- see
+    Codec_Selector_Feasibility.md's frame-count-sweep section), at the cost of
+    motion vectors that may span large real-time gaps and thus be less
+    physically meaningful.
+
+    Returns (width, height, poc_map) where poc_map maps original cv2 frame
+    index -> POC in the encoded stream (sequential 0..N-1, matching sorted
+    frame_indices order -- no window-relative offsetting needed since there's
+    no overlap/duplication).
+    """
+    import av
+    from av.video.frame import PictureType
+
+    sorted_indices = sorted(set(frame_indices))
+    needed_set = set(sorted_indices)
+    max_needed = sorted_indices[-1]
+
+    src = av.open(video_path)
+    vs = src.streams.video[0]
+    w, h = vs.codec_context.width, vs.codec_context.height
+    frames_by_idx = {}
+    frame_i = 0
+    for frame in src.decode(vs):
+        if frame_i in needed_set:
+            frames_by_idx[frame_i] = frame.to_ndarray(format="rgb24")
+        if frame_i >= max_needed:
+            break
+        frame_i += 1
+    src.close()
+
+    out = av.open(hevc_path, mode="w", format="hevc")
+    enc = out.add_stream("libx265", rate=25)
+    enc.width, enc.height = w, h
+    enc.pix_fmt = "yuv420p"
+    # Same encoder settings as _extract_and_encode_windows (see comments
+    # there); scenecut=0 here means the ONLY I-frame is the explicit first one
+    # below -- everything else stays a natural P-frame referencing the
+    # previous sampled frame, whatever the real gap between them.
+    enc.options = {"x265-params": "qp=27:pools=8:scenecut=0", "preset": "superfast"}
+    poc_map = {}
+    for new_poc, idx in enumerate(sorted_indices):
+        vf = av.VideoFrame.from_ndarray(frames_by_idx[idx], format="rgb24")
+        if new_poc == 0:
+            vf.pict_type = PictureType.I
+        for packet in enc.encode(vf):
+            out.mux(packet)
+        poc_map[idx] = new_poc
+    for packet in enc.encode():
+        out.mux(packet)
+    out.close()
+    return w, h, poc_map
+
+
+def _encode_periodic_restart(video_path: str, frame_indices, hevc_path: str, gop_restart: int):
+    """Like `_encode_sampled_frames_only` (chains the exact sampled frames,
+    no real-frame context window), but forces an I-frame every `gop_restart`
+    frames instead of only at position 0 -- x265 never references across an
+    I-frame boundary, so this "restarts the coding" at each chunk start,
+    matching AutoGaze's own real design of independent, non-overlapping
+    16-frame chunks (each with its own anchor) rather than one continuous
+    autoregressive stream. Motion vectors are computed between consecutive
+    sampled frames *within* the same chunk only; the first frame of each
+    chunk has no predecessor to reference, same as a real chunk boundary.
+
+    Returns (width, height, poc_map), same shape as `_encode_sampled_frames_only`.
+    """
+    import av
+    from av.video.frame import PictureType
+
+    sorted_indices = sorted(set(frame_indices))
+    needed_set = set(sorted_indices)
+    max_needed = sorted_indices[-1]
+
+    src = av.open(video_path)
+    vs = src.streams.video[0]
+    w, h = vs.codec_context.width, vs.codec_context.height
+    frames_by_idx = {}
+    frame_i = 0
+    for frame in src.decode(vs):
+        if frame_i in needed_set:
+            frames_by_idx[frame_i] = frame.to_ndarray(format="rgb24")
+        if frame_i >= max_needed:
+            break
+        frame_i += 1
+    src.close()
+
+    out = av.open(hevc_path, mode="w", format="hevc")
+    enc = out.add_stream("libx265", rate=25)
+    enc.width, enc.height = w, h
+    enc.pix_fmt = "yuv420p"
+    # scenecut=0 so the ONLY I-frames are the explicit periodic ones below --
+    # x265 won't insert its own extra I-frames on top of our restart cadence.
+    enc.options = {"x265-params": "qp=27:pools=8:scenecut=0", "preset": "superfast"}
+    poc_map = {}
+    for new_poc, idx in enumerate(sorted_indices):
+        vf = av.VideoFrame.from_ndarray(frames_by_idx[idx], format="rgb24")
+        if new_poc % gop_restart == 0:
+            vf.pict_type = PictureType.I
+        for packet in enc.encode(vf):
+            out.mux(packet)
+        poc_map[idx] = new_poc
+    for packet in enc.encode():
+        out.mux(packet)
+    out.close()
+    return w, h, poc_map
+
+
+def get_or_build_stats(video_path: str, frame_indices, sampled_only: bool = False, gop_restart: int | None = None):
     """Return (csv_path, width, height, poc_map) for a video's hevc_dump CSV,
-    windowed-encoding + dumping it once and caching by (path, size, mtime,
-    frame_indices)."""
+    encoding + dumping it once and caching by (path, size, mtime,
+    frame_indices, sampled_only, gop_restart). See `_extract_and_encode_windows`
+    (default) vs. `_encode_sampled_frames_only` (sampled_only=True) vs.
+    `_encode_periodic_restart` (gop_restart=N, implies sampled_only-style
+    chaining otherwise) for what each encoding strategy does."""
     os.makedirs(CACHE_DIR, exist_ok=True)
-    key = _video_key(video_path, frame_indices)
+    key = _video_key(video_path, frame_indices, sampled_only, gop_restart)
     csv_path = os.path.join(CACHE_DIR, f"{key}.csv")
     meta_path = os.path.join(CACHE_DIR, f"{key}.meta")
     pocmap_path = os.path.join(CACHE_DIR, f"{key}.pocmap")
@@ -137,7 +264,11 @@ def get_or_build_stats(video_path: str, frame_indices):
         return csv_path, w, h, poc_map
 
     hevc_path = os.path.join(CACHE_DIR, f"{key}.hevc")
-    w, h, poc_map = _extract_and_encode_windows(video_path, frame_indices, hevc_path)
+    if gop_restart:
+        w, h, poc_map = _encode_periodic_restart(video_path, frame_indices, hevc_path, gop_restart)
+    else:
+        encode_fn = _encode_sampled_frames_only if sampled_only else _extract_and_encode_windows
+        w, h, poc_map = encode_fn(video_path, frame_indices, hevc_path)
 
     yuv_path = os.path.join(CACHE_DIR, f"{key}.yuv")
     ret = os.system(f'"{DUMP_STATS_BIN}" "{hevc_path}" "{yuv_path}" "{csv_path}"')
@@ -154,7 +285,7 @@ def get_or_build_stats(video_path: str, frame_indices):
 
 
 @functools.lru_cache(maxsize=8)
-def _cached_by_poc(csv_path: str, pocs: tuple, w_motion: float, skip_penalty: float):
+def _cached_by_poc(csv_path: str, pocs: tuple, w_motion: float, skip_penalty: float, w_size: float = 1.0, w_residual: float = 0.0):
     """Parse only the needed POCs' rows out of a hevc_dump CSV once per process,
     and keep the (POC -> [(cu, score)]) grouping in memory.
 
@@ -169,16 +300,16 @@ def _cached_by_poc(csv_path: str, pocs: tuple, w_motion: float, skip_penalty: fl
     cus = h2g.parse_csv_for_pocs(csv_path, pocs)
     by_poc = {}
     for cu in cus:
-        by_poc.setdefault(cu["poc"], []).append((cu, h2g.score_cu(cu, w_motion, skip_penalty)))
+        by_poc.setdefault(cu["poc"], []).append((cu, h2g.score_cu(cu, w_motion, skip_penalty, w_size, w_residual)))
     return by_poc
 
 
 @functools.lru_cache(maxsize=1024)
-def _cached_frame_score_map(csv_path: str, poc: int, pocs: tuple, w_motion: float, skip_penalty: float, orig_w: int, orig_h: int):
+def _cached_frame_score_map(csv_path: str, poc: int, pocs: tuple, w_motion: float, skip_penalty: float, orig_w: int, orig_h: int, w_size: float = 1.0, w_residual: float = 0.0):
     """Full-resolution per-frame score map, built once per (video, POC) and reused
     across every spatial tile that needs a crop of it -- replaces re-looping over
     the frame's CU list (and repainting a canvas from scratch) once per tile."""
-    by_poc = _cached_by_poc(csv_path, pocs, w_motion, skip_penalty)
+    by_poc = _cached_by_poc(csv_path, pocs, w_motion, skip_penalty, w_size, w_residual)
     return h2g.build_frame_score_map(by_poc.get(poc, []), orig_w, orig_h)
 
 
@@ -225,6 +356,11 @@ def build_gazing_info(
     gazing_ratio_thumbnail,
     w_motion: float = 1.0,
     skip_penalty: float = 0.1,
+    w_size: float = 1.0,
+    w_residual: float = 0.0,
+    full_first_frame: bool = False,
+    sampled_only: bool = False,
+    gop_restart: int | None = None,
 ):
     """Build a codec-scored gazing_info dict for one video, matching the schema
     NVILAProcessor._get_gazing_info_from_videos produces for a single video:
@@ -234,11 +370,31 @@ def build_gazing_info(
     Unlike the autoregressive selector (which can emit a variable, EOS-terminated
     count per frame), this always selects a fixed top-k = round(total_patches *
     ratio) per frame, so if_padded is always False -- there's no padding to signal.
+
+    full_first_frame: LLaVA-OneVision-2-style I-canvas treatment (An et al. 2026,
+    sec 2.2) -- the anchor frame carries the video's global context, so instead of
+    codec-scored top-k it keeps every patch (k = total_patches) on the first frame
+    of each thumbnail sequence and of each tile's temporal chunk, leaving only the
+    remaining (P-canvas-like) frames codec-scored.
+
+    sampled_only: when True, motion/residual signal comes only from the sampled
+    frames themselves (chained sequentially, no real-frame context window) --
+    see `_encode_sampled_frames_only`. Much cheaper at high num_video_frames,
+    at the cost of motion vectors possibly spanning large real-time gaps.
+
+    gop_restart: when set (e.g. 16), forces an I-frame every `gop_restart`
+    sampled frames instead of only at position 0 -- see
+    `_encode_periodic_restart`. Combined with dense/consecutive frame_indices
+    (num_video_frames == native frame count), this "restarts the coding" at
+    each real AutoGaze-style chunk boundary, matching its actual independent,
+    non-overlapping-chunk design rather than one continuous stream. Takes
+    precedence over `sampled_only`'s encode-function choice (implies chained,
+    no-real-context encoding either way).
     """
     find_closest_aspect_ratio = _find_closest_aspect_ratio_fn()
 
     frame_indices = _sampled_frame_indices(video_path, num_video_frames)
-    csv_path, orig_w, orig_h, poc_map = get_or_build_stats(video_path, frame_indices)
+    csv_path, orig_w, orig_h, poc_map = get_or_build_stats(video_path, frame_indices, sampled_only, gop_restart)
     pocs = tuple(sorted(set(poc_map.values())))
 
     # --- replicate spatial tiling decision (processing_nvila.py::_preprocess_videos) ---
@@ -270,7 +426,7 @@ def build_gazing_info(
     total_patches = sum(g * g for g in grid_sizes)
 
     def score_region(poc, box_x0, box_y0, box_w, box_h):
-        score_map = _cached_frame_score_map(csv_path, poc, pocs, w_motion, skip_penalty, orig_w, orig_h)
+        score_map = _cached_frame_score_map(csv_path, poc, pocs, w_motion, skip_penalty, orig_w, orig_h, w_size, w_residual)
         return h2g.rasterize_multiscale_from_map(score_map, box_x0, box_y0, box_w, box_h, scales, patch_size)
 
     def topk_ratio(ratio, index):
@@ -294,7 +450,7 @@ def build_gazing_info(
             for f_local in range(T_tile):
                 poc = poc_map[frame_indices[t_chunk * T_tile + f_local]]
                 scores = score_region(poc, box_x0, box_y0, box_w, box_h)
-                k = topk_ratio(gazing_ratio_tile, f_local)
+                k = total_patches if (full_first_frame and f_local == 0) else topk_ratio(gazing_ratio_tile, f_local)
                 ranked = np.sort(np.argsort(-scores)[:k])  # ascending, matching _sort_gazing_pos_per_frame
                 frame_pos.append(torch.as_tensor(ranked, dtype=torch.long))
                 frame_counts.append(k)
@@ -313,10 +469,13 @@ def build_gazing_info(
         thumb_indices = frame_indices
 
     thumb_pos, thumb_counts = [], []
-    for real_idx in thumb_indices:
+    for thumb_i, real_idx in enumerate(thumb_indices):
         poc = poc_map[real_idx]
         scores = score_region(poc, 0, 0, orig_w, orig_h)
-        k = topk_ratio(gazing_ratio_thumbnail if gazing_ratio_thumbnail is not None else 1.0, 0)
+        if full_first_frame and thumb_i == 0:
+            k = total_patches
+        else:
+            k = topk_ratio(gazing_ratio_thumbnail if gazing_ratio_thumbnail is not None else 1.0, 0)
         ranked = np.sort(np.argsort(-scores)[:k])
         thumb_pos.append(torch.as_tensor(ranked, dtype=torch.long))
         thumb_counts.append(k)

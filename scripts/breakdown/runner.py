@@ -37,18 +37,31 @@ def load_done_ids(mode: str) -> dict:
     return done
 
 
-def run_question(model, llm_call_state, proc, item: dict, mode: str = None) -> dict:
+def run_question(model, llm_call_state, proc, item: dict, mode: str = None, skip_llm: bool = False) -> dict:
     text = f"{proc.tokenizer.video_token}\n\n{dataset.build_prompt(item)}"
 
     if mode == "codec":
         instrumentation.set_codec_video_context(item["video_path"])
 
     timing.reset()
+    instrumentation.reset_last_gazing_state()
     t0 = time.time()
     inputs = proc(text=text, videos=item["video_path"], return_tensors="pt")
-    inputs = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+    gazing_per_frame_pos = instrumentation.get_last_num_gazing_each_frame_tiles()
+    # Mean over spatial tiles -> one realized patch count per frame-within-chunk
+    # position (length T_tile, e.g. 16). Compare against the nominal
+    # gazing_ratio_tile schedule to check whether AutoGaze's actual
+    # (possibly early-stopped) allocation matches what codec statically fills --
+    # see Codec_Patch_Selection_Theory.md.
+    gazing_per_frame_pos = (
+        gazing_per_frame_pos.float().mean(dim=0).tolist() if gazing_per_frame_pos is not None else None
+    )
+    device = model.device if model is not None else config.DEVICE
+    if not skip_llm:
+        inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
     num_tokens = inputs["input_ids"].shape[1]
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     preproc_ms = (time.time() - t0) * 1000
     preproc_timing = timing.snapshot()
 
@@ -59,6 +72,39 @@ def run_question(model, llm_call_state, proc, item: dict, mode: str = None) -> d
     )
     autogaze_model_ms = preproc_timing["autogaze_model_ms"]
     other_ms = max(preproc_ms - decode_ms - image_preproc_ms - autogaze_ops_ms - autogaze_model_ms, 0.0)
+
+    if skip_llm:
+        # Patch-selection-only latency probe: never touch the LLM (no
+        # model.generate() call), so a huge nvf's token count can't OOM the
+        # forward pass -- see the VideoMME nvf=512 sampled-only OOM finding
+        # in Codec_Selector_Feasibility.md. No prediction/accuracy is
+        # possible here by design.
+        elapsed = preproc_ms / 1000
+        return {
+            "item_id": item["item_id"],
+            "pred": None,
+            "answer": dataset.LETTERS[item["answer_idx"]],
+            "preproc_ms": preproc_ms,
+            "decode_ms": decode_ms,
+            "image_preproc_ms": image_preproc_ms,
+            "autogaze_ops_ms": autogaze_ops_ms,
+            "autogaze_model_ms": autogaze_model_ms,
+            "other_ms": other_ms,
+            "cpu_ms": decode_ms + image_preproc_ms + autogaze_ops_ms + other_ms,
+            "gpu_ms": autogaze_model_ms,
+            "generate_ms": 0.0,
+            "vit_ms": 0.0,
+            "llm_prefill_ms": 0.0,
+            "llm_decode_ms": 0.0,
+            "llm_ms": 0.0,
+            "llm_calls": 0,
+            "e2e_ms": preproc_ms,
+            "gazing_per_frame_pos": gazing_per_frame_pos,
+            "correct": False,
+            "raw_text": "",
+            "num_tokens": num_tokens,
+            "elapsed_s": elapsed,
+        }
 
     timing.reset()
     llm_call_state["calls_since_reset"] = 0
@@ -94,6 +140,7 @@ def run_question(model, llm_call_state, proc, item: dict, mode: str = None) -> d
         "llm_ms": gen_timing["llm_prefill_ms"] + gen_timing["llm_decode_ms"],
         "llm_calls": gen_timing["llm_calls"],
         "e2e_ms": elapsed * 1000,
+        "gazing_per_frame_pos": gazing_per_frame_pos,
         "correct": pred == item["answer_idx"],
         "raw_text": response,
         "num_tokens": num_tokens,
@@ -120,7 +167,7 @@ def _log_result(mode: str, i: int, total: int, r: dict, correct: int, n_scored: 
     )
 
 
-def run_mode(mode: str, model, llm_call_state, samples: list) -> list:
+def run_mode(mode: str, model, llm_call_state, samples: list, skip_llm: bool = False) -> list:
     kw = {**config.COMMON_KW, **config.CONFIGS[mode]}
     print(f"\n[{mode}] kwargs: {kw}", flush=True)
 
@@ -145,7 +192,7 @@ def run_mode(mode: str, model, llm_call_state, samples: list) -> list:
             for bi, nf in enumerate(budgets):
                 try:
                     proc = static_proc or processor.build(mode, nf)
-                    r = run_question(model, llm_call_state, proc, item, mode=mode)
+                    r = run_question(model, llm_call_state, proc, item, mode=mode, skip_llm=skip_llm)
                     r["num_video_frames_used"] = nf
                     break
                 except torch.cuda.OutOfMemoryError as e:

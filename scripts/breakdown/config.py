@@ -32,6 +32,22 @@ FIXED_NUM_VIDEO_FRAMES = int(_fixed_nvf) if _fixed_nvf else None
 # latency/accuracy comparison. 1.0 = original (unscaled) behavior.
 _CODEC_RATIO_SCALE = float(os.environ.get("CODEC_RATIO_SCALE", "1.0"))
 
+# codec_selector.build_gazing_info's scoring-weight knobs, env-driven so each
+# LLaVA-OneVision-2-mimicry mechanism can be ablated in real benchmark runs
+# without code changes -- see Codec_Selector_Feasibility.md's "Integration"
+# section and the plan in .claude/plans for what each knob does. Defaults match
+# build_gazing_info's own defaults exactly, so leaving these unset reproduces
+# pre-existing behavior bit-for-bit.
+CODEC_SCORE_KW = dict(
+    w_motion=float(os.environ.get("CODEC_W_MOTION", "1.0")),
+    skip_penalty=float(os.environ.get("CODEC_SKIP_PENALTY", "0.1")),
+    w_size=float(os.environ.get("CODEC_W_SIZE", "1.0")),
+    w_residual=float(os.environ.get("CODEC_W_RESIDUAL", "0.0")),
+    full_first_frame=os.environ.get("CODEC_FULL_FIRST_FRAME", "0") == "1",
+    sampled_only=os.environ.get("CODEC_SAMPLED_ONLY", "0") == "1",
+    gop_restart=int(os.environ["CODEC_GOP_RESTART"]) if os.environ.get("CODEC_GOP_RESTART") else None,
+)
+
 COMMON_KW = dict(
     num_video_frames=FIXED_NUM_VIDEO_FRAMES or 128,
     num_video_frames_thumbnail=max((FIXED_NUM_VIDEO_FRAMES or 128) // 2, 1),
@@ -88,4 +104,8 @@ def dense_frame_budgets() -> list:
 
 
 def result_suffix() -> str:
-    return f"_nvf{FIXED_NUM_VIDEO_FRAMES}" if FIXED_NUM_VIDEO_FRAMES else ""
+    # EXTRA_SUFFIX lets codec-scoring ablation runs (Step 1+ of the
+    # LLaVA-OneVision-2-mimicry plan) write to distinct result files instead of
+    # clobbering the baseline/each other, e.g. EXTRA_SUFFIX=_wresidual1.
+    nvf_suffix = f"_nvf{FIXED_NUM_VIDEO_FRAMES}" if FIXED_NUM_VIDEO_FRAMES else ""
+    return nvf_suffix + os.environ.get("EXTRA_SUFFIX", "")

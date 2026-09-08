@@ -9,11 +9,16 @@ import importlib
 
 import torch
 
-from . import timing
+from . import config, timing
 
 _processor_module_patched = False
 _skip_autogaze_transform_state = {"skip": False}
-_codec_state = {"enabled": False, "video_path": None}
+# w_motion/skip_penalty/w_size/w_residual/full_first_frame/sampled_only come
+# straight from config.CODEC_SCORE_KW (env-var-derived, read once at process
+# start) -- these are static per-run settings, unlike video_path, so no
+# per-question update.
+_codec_state = {"enabled": False, "video_path": None, **config.CODEC_SCORE_KW}
+_last_gazing_state = {"num_gazing_each_frame_tiles": None}
 
 
 def set_codec_video_context(video_path: str) -> None:
@@ -21,6 +26,25 @@ def set_codec_video_context(video_path: str) -> None:
     patched _get_gazing_info_from_videos knows which video to score. See
     codec_selector.py and HEVC_Dump_Pipeline.md."""
     _codec_state["video_path"] = video_path
+
+
+def reset_last_gazing_state() -> None:
+    """Call before each proc(...) invocation so a stale capture from a prior
+    question (e.g. one that raised before reaching gazing) can't leak into
+    the next question's result."""
+    _last_gazing_state["num_gazing_each_frame_tiles"] = None
+
+
+def get_last_num_gazing_each_frame_tiles():
+    """Returns the (num_tiles, T_tile) CPU tensor of *realized* per-tile,
+    per-frame-position patch counts from the most recent
+    _get_gazing_info_from_videos call (either mode), or None if it wasn't
+    captured (e.g. the call returned None). Used to check whether AutoGaze's
+    actual (possibly early-stopped) per-frame-position allocation matches
+    the nominal gazing_ratio_tile schedule that codec mode statically fills
+    -- see Codec_Patch_Selection_Theory.md's "ratio schedule is not
+    codec-derived" caveat."""
+    return _last_gazing_state["num_gazing_each_frame_tiles"]
 
 
 def _make_gazing_info_codec_override(orig_fn):
@@ -38,24 +62,42 @@ def _make_gazing_info_codec_override(orig_fn):
     """
     def overridden(self, videos_inputs):
         if not _codec_state["enabled"]:
-            return orig_fn(self, videos_inputs)
-        from . import codec_selector
+            result = orig_fn(self, videos_inputs)
+        else:
+            from . import codec_selector
 
-        image_size = (
-            self.image_processor.size.get("height", 392) if hasattr(self.image_processor, "size") else 392
-        )
-        return codec_selector.build_gazing_info(
-            video_path=_codec_state["video_path"],
-            num_video_frames=self.num_video_frames,
-            num_video_frames_thumbnail=self.num_video_frames_thumbnail,
-            max_tiles_video=self.max_tiles_video,
-            autogaze_max_num_frames=self._autogaze_model.config.max_num_frames,
-            image_size=image_size,
-            scales=self.target_scales,
-            patch_size=self.target_patch_size,
-            gazing_ratio_tile=self.gazing_ratio_tile,
-            gazing_ratio_thumbnail=self.gazing_ratio_thumbnail,
-        )
+            image_size = (
+                self.image_processor.size.get("height", 392) if hasattr(self.image_processor, "size") else 392
+            )
+            result = codec_selector.build_gazing_info(
+                video_path=_codec_state["video_path"],
+                num_video_frames=self.num_video_frames,
+                num_video_frames_thumbnail=self.num_video_frames_thumbnail,
+                max_tiles_video=self.max_tiles_video,
+                autogaze_max_num_frames=self._autogaze_model.config.max_num_frames,
+                image_size=image_size,
+                scales=self.target_scales,
+                patch_size=self.target_patch_size,
+                gazing_ratio_tile=self.gazing_ratio_tile,
+                gazing_ratio_thumbnail=self.gazing_ratio_thumbnail,
+                w_motion=_codec_state["w_motion"],
+                skip_penalty=_codec_state["skip_penalty"],
+                w_size=_codec_state["w_size"],
+                w_residual=_codec_state["w_residual"],
+                full_first_frame=_codec_state["full_first_frame"],
+                sampled_only=_codec_state["sampled_only"],
+                gop_restart=_codec_state["gop_restart"],
+            )
+        # Capture the realized per-tile, per-frame-position patch counts (not
+        # just the nominal ratio schedule) so callers can check whether
+        # AutoGaze's actual early-stopped allocation matches the schedule
+        # codec mode statically fills -- see reset_last_gazing_state()/
+        # get_last_num_gazing_each_frame_tiles() above.
+        if result is not None:
+            ng = result.get("num_gazing_each_frame_tiles")
+            if ng:
+                _last_gazing_state["num_gazing_each_frame_tiles"] = ng[0].detach().cpu()
+        return result
     return overridden
 
 

@@ -136,6 +136,35 @@ tiles and thumbnails (dense mode) — safe because that output is never read in 
 - `benchmark_results/nvila_hd_accuracy_breakdown_{autogaze,dense}_egoschema_nvf16.jsonl` — per-question (this README's n=25 numbers)
 - `benchmark_results/nvila_hd_accuracy_breakdown_summary_egoschema_nvf16.json` — averaged summary
 
+## Codec-Based Selector: A Drop-In Alternative to AutoGaze
+
+`"codec"` mode (`scripts/breakdown`) replaces AutoGaze's trained autoregressive selector
+with a cheap heuristic: score HEVC coding units (small + motion-heavy + non-skip →
+important) via `codec_selector.build_gazing_info()`, a drop-in substitute with the same
+integration point and output schema as AutoGaze's own selector.
+
+**Headline result (N=500 EgoSchema, N=1395 VideoMME, nvf=16):** codec mode matches or
+beats AutoGaze on both accuracy and latency — 61.4% vs. 60.4% accuracy on EgoSchema
+(5,214ms vs. 8,328ms avg e2e), 55.9% vs. 55.6% on VideoMME (4,021ms vs. 9,571ms).
+AutoGaze's own trained selector turns out to be the slowest of the three
+patch-selection approaches tested (real selector vs. codec's two encoding strategies)
+at every nvf measured in isolation, not just when bundled with the LLM call.
+
+**Two codec encoding strategies** were compared head-to-head across nvf=16-1024:
+*windowed* (real temporally-adjacent context frames per sample) vs. *sampled-only*
+(only the sampled frames themselves, chained). Accuracy is essentially identical
+between the two everywhere tested; sampled-only is consistently 11-39% faster.
+
+**Known limits at high nvf:** a pre-existing `max_tiles_video = num_video_frames`
+coupling (unrelated to codec vs. AutoGaze) makes the patch-selection cost explode
+combinatorially past nvf≈256, and the real LLM forward pass can OOM outright at
+nvf≥512 on wide-aspect videos regardless of selector choice — see the full writeup for
+root causes, latency-only isolation results, and known infra gotchas (shared scratch
+quota, concurrent-writer resume bugs) hit while gathering this data.
+
+**Full results, methodology, comparison videos, and reproduction commands:**
+[`Codec_Selector_Feasibility.md`](Codec_Selector_Feasibility.md).
+
 ## Idea: Student Distillation for Faster AutoGaze
 
 The latency breakdown above shows AutoGaze's gazing model is the dominant cost, driven by its

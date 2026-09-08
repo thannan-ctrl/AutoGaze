@@ -30,9 +30,13 @@ import os
 import subprocess
 from collections import defaultdict
 
-PRED_MODE, PART_MODE, QP, INTRA_PRED_MODE, MV_L0, MV_L1 = range(6)
+PRED_MODE, PART_MODE, QP, INTRA_PRED_MODE, MV_L0, MV_L1, RESIDUAL_ENERGY, BITCOST = range(8)
 SKIP = 2
 MAX_CU_SIZE = 64  # HEVC max CTU side length
+# Matches dump_stats.cc::write_stats_header's ResidualEnergy range line
+# ("%;range;0;1000000;..."), i.e. the same 0-1e6 scale the C++ side already
+# assumes when painting residual-energy visualizations.
+MAX_RESIDUAL_ENERGY = 1_000_000
 
 
 def _rows_to_cus(rows):
@@ -51,7 +55,13 @@ def _rows_to_cus(rows):
             cu["qp"] = int(row[6])
         elif type_id in (MV_L0, MV_L1):
             cu["mvs"].append((int(row[6]), int(row[7])))
-        # PART_MODE / INTRA_PRED_MODE currently unused by the scoring heuristic
+        elif type_id == RESIDUAL_ENERGY:
+            cu["residual_energy"] = int(row[6])
+        elif type_id == BITCOST:
+            cu["bitcost"] = int(row[6])
+        # PART_MODE / INTRA_PRED_MODE currently unused by the scoring heuristic. bitcost is
+        # parsed but not yet consumed by score_cu -- it's the per-bin bit-cost signal Step 5
+        # (adaptive GOP partitioning) needs; see the plan in .claude/plans.
     return list(cus.values())
 
 
@@ -84,12 +94,16 @@ def parse_csv_for_pocs(csv_path, pocs):
     return _rows_to_cus(csv.reader(proc.stdout.splitlines(), delimiter=";"))
 
 
-def score_cu(cu, w_motion, skip_penalty):
+def score_cu(cu, w_motion, skip_penalty, w_size=1.0, w_residual=0.0):
     area = cu["w"] * cu["h"]
-    size_score = 1.0 - min(area, MAX_CU_SIZE**2) / (MAX_CU_SIZE**2)
+    size_score = w_size * (1.0 - min(area, MAX_CU_SIZE**2) / (MAX_CU_SIZE**2))
     mv_mag = max((mx**2 + my**2) ** 0.5 for mx, my in cu["mvs"]) if cu["mvs"] else 0.0
     motion_score = w_motion * min(mv_mag / 256.0, 1.0)  # quarter-pel; cap at 64px
-    score = size_score + motion_score
+    # LLaVA-OneVision-2-style residual term (An et al. 2026, sec 2.2): luma
+    # residual energy as a second saliency signal alongside motion, fused
+    # additively rather than relying on CU size alone as a complexity proxy.
+    residual_score = w_residual * min(cu.get("residual_energy", 0) / MAX_RESIDUAL_ENERGY, 1.0)
+    score = size_score + motion_score + residual_score
     if cu.get("pred_mode") == SKIP:
         score *= skip_penalty
     return score
