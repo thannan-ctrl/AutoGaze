@@ -69,10 +69,11 @@ sparse sampling happens to leave.
 **LLaVA-OneVision-2** seems to solve this — it scores saliency on *every* real frame of
 the compressed stream, with adaptive GOP boundaries that let frame allocation fall out
 of the motion signal instead of preceding it, and no sparse-sampling gap to begin with.
-Its own problem: it doesn't report compute/memory cost for doing so. It does train at up
-to 768 frames/10-15min without incident, which points our OOM wall more at this repo's
-`max_tiles_video` coupling bug than an inherent limit — but "seems to" is doing real work
-in that sentence.
+Its own problem: the paper shows no latency or memory numbers anywhere for this
+pipeline — not for the codec-stream preprocessing, not for training, not for inference.
+It does train at up to 768 frames/10-15min without incident, which points our OOM wall
+more at this repo's `max_tiles_video` coupling bug than an inherent limit — but "seems
+to" is doing real work in that sentence.
 
 <table>
 <tr>
