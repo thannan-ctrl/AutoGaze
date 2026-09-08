@@ -8,18 +8,19 @@
 
 ## Results
 
+All commands below: `conda activate auto_gaze` first (GB200 = aarch64; build
+`hevc_dump/cmake_build_aarch64` before any codec-mode run). Swap `DATASET=egoschema`
+for `DATASET=video_mme` to run the other dataset.
+
 **1. At 16 frames, codec matches AutoGaze on accuracy and is faster end-to-end:**
 
-GIFs below are downsampled previews (patch selection overlaid on the actual frames);
-each links to the full-res video.
-
-Side by side, same video, same nvf ([full-res video](figures/codec_vs_autogaze_egoschema_comparison.mp4)):
+GIFs are downsampled previews; captions link the full-res video.
 
 ![AutoGaze vs. codec, EgoSchema](figures/codec_vs_autogaze_egoschema_comparison.gif)
-
-VideoMME ([full-res video](figures/codec_vs_autogaze_video_mme_comparison.mp4)):
+[EgoSchema, full-res](figures/codec_vs_autogaze_egoschema_comparison.mp4)
 
 ![AutoGaze vs. codec, VideoMME](figures/codec_vs_autogaze_video_mme_comparison.gif)
+[VideoMME, full-res](figures/codec_vs_autogaze_video_mme_comparison.mp4)
 
 | Mode | Accuracy | Total time | Selection time | LLM time | Tokens |
 |---|---|---|---|---|---|
@@ -31,6 +32,20 @@ VideoMME ([full-res video](figures/codec_vs_autogaze_video_mme_comparison.mp4)):
 | codec | **55.9%** | **4.0s** | **2.7s** | **0.3s** | 1,547 |
 | AutoGaze | 55.6% | 9.6s | 8.1s | 0.4s | **1,526** |
 | dense | 54.9% | 5.7s | — | 4.6s | 28,318 |
+
+<details>
+<summary>Commands</summary>
+
+```bash
+CUDA_VISIBLE_DEVICES=0 REPO_DIR=$(pwd) NVILA_DEVICE=cuda:0 \
+  FIXED_NUM_VIDEO_FRAMES=16 N_SAMPLES=full MAX_BATCH_SIZE_AUTOGAZE=32 MODES=codec,autogaze,dense \
+  CODEC_RATIO_SCALE=0.28 DATASET=egoschema python3 scripts/nvila_hd_accuracy_breakdown_test.py
+
+# comparison video
+python3 scripts/visualize_codec_vs_autogaze_video.py --video <path.mp4> --out figures/out.mp4
+```
+
+</details>
 
 **2. Windowed vs. sampled-only: same accuracy, sampled-only is consistently faster:**
 
@@ -49,39 +64,76 @@ VideoMME ([full-res video](figures/codec_vs_autogaze_video_mme_comparison.mp4)):
 *64% vs. 60% at 32 frames on EgoSchema is likely N=25 noise. Accuracy degrades past 128
 frames and keeps falling — 12% by 1024.
 
+<details>
+<summary>Commands</summary>
+
+```bash
+for nvf in 16 32 64 128 256 512; do
+  # windowed: real local-frame context around each sampled frame (default)
+  REPO_DIR=$(pwd) NVILA_DEVICE=cuda:0 FIXED_NUM_VIDEO_FRAMES=$nvf N_SAMPLES=25 \
+    MODES=codec DATASET=egoschema EXTRA_SUFFIX=_windowedn25_$nvf \
+    python3 scripts/nvila_hd_accuracy_breakdown_test.py
+
+  # sampled-only: just the sampled frames, chained, no extra context
+  REPO_DIR=$(pwd) NVILA_DEVICE=cuda:0 FIXED_NUM_VIDEO_FRAMES=$nvf N_SAMPLES=25 \
+    MODES=codec DATASET=egoschema CODEC_SAMPLED_ONLY=1 EXTRA_SUFFIX=_sampledonly$nvf \
+    python3 scripts/nvila_hd_accuracy_breakdown_test.py
+done
+```
+
+`CODEC_SAMPLED_ONLY=1` sampled-only encoding · `N_SAMPLES=full|<int>` dataset size ·
+`EXTRA_SUFFIX` keeps result files from clobbering each other across sweep points.
+
+</details>
+
 **3. Matching AutoGaze's actual chunking (restart encoding every 16 frames, keep full
 detail on each chunk's first frame) did not help:**
 
-Building up to that experiment — dense, consecutive real frames, no sparse sampling
-(AutoGaze's own QUICK_START.md prescription; constant 125 patches/frame;
-[full-res video](figures/full_video_codec_egoschema.mp4)):
+Building up to that experiment:
 
 ![Whole video, dense 16-frame chunks](figures/full_video_codec_egoschema.gif)
-
-+ full-first-frame anchor per chunk — every patch kept on each chunk's first frame
-(1,038 patches at chunk boundaries;
-[full-res video](figures/full_video_codec_egoschema_fullfirstframe.mp4)):
+Dense, consecutive real frames, no sparse sampling — constant 125 patches/frame.
+[Full-res](figures/full_video_codec_egoschema.mp4)
 
 ![+ full-first-frame anchor per chunk](figures/full_video_codec_egoschema_fullfirstframe.gif)
-
-Same on VideoMME, ~20s crop — this video's higher motion complexity OOMs the CU-level
-scoring cache at anything longer, independent of frame count
-([full-res video](figures/full_video_codec_video_mme_fullfirstframe.mp4)):
++ full-first-frame anchor per chunk — every patch kept on each chunk's first frame
+(1,038 patches at boundaries). [Full-res](figures/full_video_codec_egoschema_fullfirstframe.mp4)
 
 ![VideoMME, full-first-frame, 20s crop](figures/full_video_codec_video_mme_fullfirstframe.gif)
-
-The actual experiment: codec restarted every 16 frames + full-first-frame anchor, run
-head-to-head against AutoGaze's real trained selector on the same video (AutoGaze holds
-constant at 109 patches/frame;
-[full-res video](figures/restarted_chunks_vs_autogaze_egoschema.mp4)):
+Same on VideoMME, ~20s crop (higher motion complexity OOMs the CU-level scoring cache
+past that). [Full-res](figures/full_video_codec_video_mme_fullfirstframe.mp4)
 
 ![+ restart-coding/chunk vs. real AutoGaze](figures/restarted_chunks_vs_autogaze_egoschema.gif)
+The actual experiment: restart every 16 frames + full-first-frame anchor, head-to-head
+against AutoGaze's real selector (AutoGaze holds constant at 109 patches/frame).
+[Full-res](figures/restarted_chunks_vs_autogaze_egoschema.mp4)
 
 | Dataset | Sampled-only (128 frames) | + restart/anchor | Tokens |
 |---|---|---|---|
 | EgoSchema | **68.0%** | **68.0%** | 37,873 vs. **25,129** (1.5x) |
 | VideoMME | **76.0%** | 48.0% | 86,240 vs. **53,035** (1.6x) |
 
+<details>
+<summary>Commands</summary>
+
+```bash
+REPO_DIR=$(pwd) NVILA_DEVICE=cuda:0 FIXED_NUM_VIDEO_FRAMES=128 N_SAMPLES=25 \
+  MODES=codec DATASET=egoschema \
+  CODEC_SAMPLED_ONLY=1 CODEC_GOP_RESTART=16 CODEC_FULL_FIRST_FRAME=1 \
+  EXTRA_SUFFIX=_restart16_fff \
+  python3 scripts/nvila_hd_accuracy_breakdown_test.py
+
+# whole video, real consecutive 16-frame chunks (add --full-first-frame for the anchor variant)
+python3 scripts/visualize_full_video_codec.py --video <path.mp4> --out figures/out.mp4
+
+# restart-every-16 + full-first-frame vs. real AutoGaze
+python3 scripts/visualize_restarted_chunks_vs_autogaze.py --video <path.mp4> --out figures/out.mp4
+```
+
+`CODEC_GOP_RESTART=N` force an I-frame every N sampled frames ·
+`CODEC_FULL_FIRST_FRAME=1` keep every patch on each chunk's first frame.
+
+</details>
 
 **4. Isolating selection time alone (no ViT, no LLM)**
 
@@ -102,54 +154,7 @@ finishes the full sweep on both datasets (419s EgoSchema, 1,384s VideoMME) — t
 real-frame context windowing and AutoGaze's own model both carry is what tips memory
 over the edge; sampled-only's flat per-frame footprint doesn't.
 
-</details>
-
-
-## Reproducing
-
-All commands: `conda activate auto_gaze` first (GB200 = aarch64; build
-`hevc_dump/cmake_build_aarch64` before any codec-mode run). Swap
-`DATASET=egoschema` for `DATASET=video_mme` to run the other dataset.
-
-<details>
-<summary><strong>Commands for every experiment above (click to expand)</strong></summary>
-
-**Finding 1 — nvf=16 accuracy/latency, full dataset, all three modes:**
-
-```bash
-CUDA_VISIBLE_DEVICES=0 REPO_DIR=$(pwd) NVILA_DEVICE=cuda:0 \
-  FIXED_NUM_VIDEO_FRAMES=16 N_SAMPLES=full MAX_BATCH_SIZE_AUTOGAZE=32 MODES=codec,autogaze,dense \
-  CODEC_RATIO_SCALE=0.28 DATASET=egoschema python3 scripts/nvila_hd_accuracy_breakdown_test.py
-```
-
-**Finding 2 — windowed vs. sampled-only accuracy sweep, N=25:**
-
-```bash
-for nvf in 16 32 64 128 256 512; do
-  # windowed: real local-frame context around each sampled frame (default)
-  REPO_DIR=$(pwd) NVILA_DEVICE=cuda:0 FIXED_NUM_VIDEO_FRAMES=$nvf N_SAMPLES=25 \
-    MODES=codec DATASET=egoschema EXTRA_SUFFIX=_windowedn25_$nvf \
-    python3 scripts/nvila_hd_accuracy_breakdown_test.py
-
-  # sampled-only: just the sampled frames, chained, no extra context
-  REPO_DIR=$(pwd) NVILA_DEVICE=cuda:0 FIXED_NUM_VIDEO_FRAMES=$nvf N_SAMPLES=25 \
-    MODES=codec DATASET=egoschema CODEC_SAMPLED_ONLY=1 EXTRA_SUFFIX=_sampledonly$nvf \
-    python3 scripts/nvila_hd_accuracy_breakdown_test.py
-done
-```
-
-**Finding 3 — restart-every-16-frames + full-first-frame anchor, N=25:**
-
-```bash
-REPO_DIR=$(pwd) NVILA_DEVICE=cuda:0 FIXED_NUM_VIDEO_FRAMES=128 N_SAMPLES=25 \
-  MODES=codec DATASET=egoschema \
-  CODEC_SAMPLED_ONLY=1 CODEC_GOP_RESTART=16 CODEC_FULL_FIRST_FRAME=1 \
-  EXTRA_SUFFIX=_restart16_fff \
-  python3 scripts/nvila_hd_accuracy_breakdown_test.py
-```
-
-**Finding 4 — selection-only latency (no LLM, avoids the high-nvf OOM), autogaze vs.
-windowed vs. sampled-only:**
+**Commands:**
 
 ```bash
 for nvf in 16 32 64 128 256 512 1024; do
@@ -170,25 +175,7 @@ for nvf in 16 32 64 128 256 512 1024; do
 done
 ```
 
-**Videos** (side-by-side visualizations, no accuracy/latency measurement — build a
-processor + run one video through both selectors):
-
-```bash
-# AutoGaze vs. codec, sampled frames only
-python3 scripts/visualize_codec_vs_autogaze_video.py --video <path.mp4> --out figures/out.mp4
-
-# whole video, real consecutive 16-frame chunks (add --full-first-frame for the anchor variant)
-python3 scripts/visualize_full_video_codec.py --video <path.mp4> --out figures/out.mp4
-
-# AutoGaze vs. codec restart-every-16 + full-first-frame/chunk
-python3 scripts/visualize_restarted_chunks_vs_autogaze.py --video <path.mp4> --out figures/out.mp4
-```
-
-Env knobs used above: `SKIP_LLM=1` selection-latency only (never loads the 8B model) ·
-`CODEC_SAMPLED_ONLY=1` sampled-only encoding · `CODEC_GOP_RESTART=N` force an I-frame
-every N sampled frames · `CODEC_FULL_FIRST_FRAME=1` keep every patch on each chunk's
-first frame · `N_SAMPLES=full|<int>` dataset size · `EXTRA_SUFFIX` keeps result files
-from clobbering each other across sweep points.
+`SKIP_LLM=1` selection-latency only (never loads the 8B model).
 
 </details>
 
