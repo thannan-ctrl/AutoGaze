@@ -92,8 +92,8 @@ def main():
     ap.add_argument("--thumb-ratio", type=float, default=0.12,
                      help="nominal fraction of patches kept per frame, same value for both panels")
     ap.add_argument("--out", default="figures/windowed_vs_sampledonly.mp4")
-    ap.add_argument("--fps", type=int, default=4)
-    ap.add_argument("--hold-frames", type=int, default=6)
+    ap.add_argument("--fps", type=int, default=12)
+    ap.add_argument("--hold-frames", type=int, default=18)
     args = ap.parse_args()
 
     print("[setup] building processor (loads AutoGaze weights, no forward pass)...", flush=True)
@@ -142,7 +142,7 @@ def main():
     n_frames = thumbs.shape[0]
     print(f"[info] {n_frames} thumbnail frames, w_pos.shape={tuple(w_pos.shape)} s_pos.shape={tuple(s_pos.shape)}", flush=True)
 
-    fig, axes = plt.subplots(1, 2, figsize=(9.6, 5.2), facecolor="#fcfcfb")
+    fig, axes = plt.subplots(1, 2, figsize=(6.0, 5.2), facecolor="#fcfcfb")
     fig.tight_layout(rect=(0, 0, 1, 0.92))
     subtitle = f"  (codec: windowed vs. sampled-only encoding, nvf={args.num_frames})"
 

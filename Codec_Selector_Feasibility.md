@@ -51,6 +51,9 @@ python3 scripts/visualize_codec_vs_autogaze_video.py --video <path.mp4> --out fi
 
 ![Windowed vs. sampled-only concept](figures/windowed_vs_sampledonly_concept.png)
 
+![Windowed vs. sampled-only, same video](figures/windowed_vs_sampledonly_egoschema.gif)
+[Full-res](figures/windowed_vs_sampledonly_egoschema.mp4)
+
 | Frames | EgoSchema acc. | Windowed | Sampled-only | Δ | VideoMME acc. | Windowed | Sampled-only | Δ |
 |---|---|---|---|---|---|---|---|---|
 | 16 | 68.0% | **4.1s** | 4.2s | +1.6% | 60.0% | 6.6s | **5.6s** | -15.5% |
@@ -89,23 +92,21 @@ done
 **3. Matching AutoGaze's actual chunking (restart encoding every 16 frames, keep full
 detail on each chunk's first frame) did not help:**
 
-Building up to that experiment:
+Building up to it — dense chunks, +anchor frame, +restart vs. real AutoGaze:
 
 ![Whole video, dense 16-frame chunks](figures/full_video_codec_egoschema.gif)
-Dense, consecutive real frames, no sparse sampling — constant 125 patches/frame.
-[Full-res](figures/full_video_codec_egoschema.mp4)
+Dense chunks, 125 patches/frame. [Full-res](figures/full_video_codec_egoschema.mp4)
 
 ![+ full-first-frame anchor per chunk](figures/full_video_codec_egoschema_fullfirstframe.gif)
-+ full-first-frame anchor per chunk — every patch kept on each chunk's first frame
-(1,038 patches at boundaries). [Full-res](figures/full_video_codec_egoschema_fullfirstframe.mp4)
++ full-first-frame anchor, 1,038 patches at boundaries.
+[Full-res](figures/full_video_codec_egoschema_fullfirstframe.mp4)
 
 ![VideoMME, full-first-frame, 20s crop](figures/full_video_codec_video_mme_fullfirstframe.gif)
-Same on VideoMME, ~20s crop (higher motion complexity OOMs the CU-level scoring cache
-past that). [Full-res](figures/full_video_codec_video_mme_fullfirstframe.mp4)
+Same, VideoMME, ~20s crop (higher motion complexity caps duration).
+[Full-res](figures/full_video_codec_video_mme_fullfirstframe.mp4)
 
 ![+ restart-coding/chunk vs. real AutoGaze](figures/restarted_chunks_vs_autogaze_egoschema.gif)
-The actual experiment: restart every 16 frames + full-first-frame anchor, head-to-head
-against AutoGaze's real selector (AutoGaze holds constant at 109 patches/frame).
++ restart every 16 frames, vs. real AutoGaze (constant 109 patches/frame).
 [Full-res](figures/restarted_chunks_vs_autogaze_egoschema.mp4)
 
 | Dataset | Sampled-only (128 frames) | + restart/anchor | Tokens |
