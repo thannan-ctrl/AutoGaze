@@ -56,21 +56,23 @@ python3 scripts/visualize_codec_vs_autogaze_video.py --video <path.mp4> --out fi
 ### 2. Windowed vs. sampled-only: same accuracy, sampled-only is consistently faster
 
 AutoGaze itself starts from a limitation: it samples frames sparsely across the video
-instead of working on the continuous stream. Codec mode inherited that when we adopted
-it, and both encoding variants here still carry it — neither ever scores genuinely
-consecutive real frames. Windowed decodes a few real frames of local context around
-each sampled point, but the sampled points themselves can still be seconds apart;
-sampled-only skips that context entirely and computes motion vectors directly between
-samples, treating far-apart frames as if adjacent. Neither matches what HEVC motion
-vectors are actually designed to measure — prediction between frames a fraction of a
-second apart, not whatever gap sparse sampling happens to leave.
+instead of working on the continuous stream, because keeping every frame around is what
+OOMs (see Finding 4). Codec mode inherited that when we adopted it, and both encoding
+variants here still carry it — neither ever scores genuinely consecutive real frames.
+Windowed decodes a few real frames of local context around each sampled point, but the
+sampled points themselves can still be seconds apart; sampled-only skips that context
+entirely and computes motion vectors directly between samples, treating far-apart frames
+as if adjacent. Neither matches what HEVC motion vectors are actually designed to
+measure — prediction between frames a fraction of a second apart, not whatever gap
+sparse sampling happens to leave.
 
-**LLaVA-OneVision-2** avoids this by not sampling at all: it scores saliency on *every*
-real frame of the compressed stream, with adaptive GOP boundaries that let frame
-allocation fall out of the motion signal instead of preceding it. Its own problem is
-that it doesn't report compute/memory cost for doing so — it trains at up to 768
-frames/10-15min without incident, which points our OOM wall more at this repo's
-`max_tiles_video` coupling bug than an inherent limit.
+**LLaVA-OneVision-2** seems to solve this — it scores saliency on *every* real frame of
+the compressed stream, with adaptive GOP boundaries that let frame allocation fall out
+of the motion signal instead of preceding it, and no sparse-sampling gap to begin with.
+Its own problem: it doesn't report compute/memory cost for doing so. It does train at up
+to 768 frames/10-15min without incident, which points our OOM wall more at this repo's
+`max_tiles_video` coupling bug than an inherent limit — but "seems to" is doing real work
+in that sentence.
 
 <table>
 <tr>
@@ -87,7 +89,7 @@ frames/10-15min without incident, which points our OOM wall more at this repo's
 | 16 | 68.0% | **4.1s** | 4.2s | +1.6% | 60.0% | 6.6s | **5.6s** | -15.5% |
 | 32 | 64/60%* | 11.0s | **7.6s** | -31.2% | 60.0% | 14.6s | **12.3s** | -15.8% |
 | 64 | 68.0% | 17.2s | **15.4s** | -10.8% | 64.0% | 38.1s | **33.7s** | -11.4% |
-| 128 | 68.0% | 34.1s | **30.0s** | -12.0% | — | — | 67.5s | — |
+| 128 | 68.0% | 34.1s | **30.0s** | -12.0% | | | 67.5s | |
 | 256 | 60.0% | 133.6s | **103.2s** | -22.8% | | | | |
 | 512 | 40.0% | 152.6s | **92.4s** | -39.4% | | | | |
 | 1024 | 12.0% | **324.8s** | 419.1s | +29.0% | | | | |
