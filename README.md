@@ -4,6 +4,11 @@
 
 AutoGaze (Autoregressive Gazing) is a model that automatically selects informative patches and removes redundant ones in any video, such that downstream ViTs/MLLMs can process fewer patches without information loss. This makes downstream ViTs/MLLMs much more scalable to high-resolution, high-FPS, long-form videos (e.g., 4K-resolution 1K-frame videos).
 
+> **See also:** [`Codec_Selector_Feasibility.md`](Codec_Selector_Feasibility.md) —
+> can AutoGaze's trained selector be replaced with a free HEVC-motion-vector heuristic?
+> Matches AutoGaze on accuracy and beats it on latency up to ~128 sampled frames; both
+> hit scaling/OOM limits above that.
+
 ## NVILA-HD-Video @ nvf=16: Fine-Grained Latency Breakdown
 
 Dense vs AutoGaze (chunked-batched, `MAX_BATCH_SIZE_AUTOGAZE=64`), 25 EgoSchema questions.
