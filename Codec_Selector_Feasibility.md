@@ -10,6 +10,10 @@
 
 **1. At 16 frames, codec matches AutoGaze on accuracy and is faster end-to-end:**
 
+Side by side, same video, same nvf:
+[EgoSchema](figures/codec_vs_autogaze_egoschema_comparison.mp4) ·
+[VideoMME](figures/codec_vs_autogaze_video_mme_comparison.mp4)
+
 | Mode | Accuracy | Total time | Selection time | LLM time | Tokens |
 |---|---|---|---|---|---|
 | **EgoSchema, N=500** | | | | | |
@@ -72,10 +76,8 @@ over the edge; sampled-only's flat per-frame footprint doesn't.
 ## Videos
 
 nvf=16 unless noted — patch selection overlaid on the actual frames, not just numbers.
+(AutoGaze vs. codec side by side is under Finding 1, above.)
 
-- **AutoGaze vs. codec, side by side**, same video, same nvf:
-  [EgoSchema](figures/codec_vs_autogaze_egoschema_comparison.mp4) ·
-  [VideoMME](figures/codec_vs_autogaze_video_mme_comparison.mp4)
 - **[Whole video, dense 16-frame chunks](figures/full_video_codec_egoschema.mp4)** —
   codec run the way AutoGaze's own QUICK_START.md prescribes: back-to-back chunks from
   frame 0, no sparse sampling (constant 125 patches/frame)
