@@ -241,6 +241,12 @@ other dataset. GIFs are downsampled previews — captions link the full-res vide
 
 ## Next Steps
 
-1. Integrate NVDEC into codec mode.
+1. **Integrate NVDEC into codec mode — in progress.** A `codec_nvdec` backend
+   (PyNvVideoCodec 16x16 decode-stats grid, ~90x/frame faster than libde265 once
+   CreateDemuxer/CreateDecoder setup amortizes — see README) is wired into
+   `build_gazing_info(backend=...)`, but the actual decode module
+   (`scripts/nvdec_dump.py`) and the `PyNvVideoCodec` package aren't in this
+   checkout yet, so `codec_nvdec` currently fails clearly rather than running.
+   sampled_only/gop_restart aren't wired up for it either.
 2. Implement LLaVA-OneVision-2's actual approach, then profile its real latency (the
    paper never reports this) and add NVDEC to that pipeline too.
