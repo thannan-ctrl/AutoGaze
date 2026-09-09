@@ -17,9 +17,15 @@ LETTERS = config.LETTERS
 
 def _load_egoschema() -> list:
     subset = json.load(open(os.path.join(config.DATA_DIR, "egoschema", "subset.json")))
-    random.seed(config.SEED)
-    n = len(subset) if not config.N_SAMPLES else min(config.N_SAMPLES, len(subset))
-    sampled = random.sample(subset, n)
+    item_id = os.environ.get("ITEM_ID")
+    if item_id:
+        sampled = [it for it in subset if it["q_uid"] == item_id]
+        if not sampled:
+            raise ValueError(f"ITEM_ID={item_id!r} not found in egoschema subset")
+    else:
+        random.seed(config.SEED)
+        n = len(subset) if not config.N_SAMPLES else min(config.N_SAMPLES, len(subset))
+        sampled = random.sample(subset, n)
     items = []
     for it in sampled:
         items.append({
@@ -39,8 +45,14 @@ def _load_videomme() -> list:
     video_dir = os.path.join(config.DATA_DIR, "video_mme", "videos")
     available = {f.rsplit(".", 1)[0] for f in os.listdir(video_dir)}
     usable = [q for q in questions if q["video_id"] in available]
-    random.seed(config.SEED)
-    sampled = random.sample(usable, min(config.N_SAMPLES, len(usable))) if config.N_SAMPLES else usable
+    item_id = os.environ.get("ITEM_ID")
+    if item_id:
+        sampled = [q for q in usable if q["question_id"] == item_id]
+        if not sampled:
+            raise ValueError(f"ITEM_ID={item_id!r} not found among usable video_mme questions")
+    else:
+        random.seed(config.SEED)
+        sampled = random.sample(usable, min(config.N_SAMPLES, len(usable))) if config.N_SAMPLES else usable
     items = []
     for it in sampled:
         items.append({

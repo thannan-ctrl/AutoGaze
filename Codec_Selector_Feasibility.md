@@ -239,6 +239,37 @@ other dataset. GIFs are downsampled previews — captions link the full-res vide
 
 </details>
 
+## Single-Video Sanity Check (vs. LLaVA-OneVision-2)
+
+Same two videos as LLaVA-OV-2's own frames-vs-codec smoke test
+(`llava_onevision2_repro/SMOKE_TEST.md`, separate repo), run through this
+repo's pipeline at nvf=64 — different VLM, different selector, not a
+controlled comparison, just a rough cross-check with the same source videos.
+
+| Dataset | Mode | Tokens | Encode | Selector | ViT | LLM | E2E |
+|---|---|---:|---:|---:|---:|---:|---:|
+| EgoSchema (0074f737…, 180s) | dense | — | — | — | — | — | **OOM** (92,392 tokens, 40,960 limit) |
+| EgoSchema | AutoGaze | 5,678 | — | 28.1s | 2.1s | 0.5s | **36.5s** |
+| EgoSchema | codec | 9,908 | 1.2s | 16.2s* | 0.8s | 0.5s | **20.4s** |
+| VideoMME (001-1, fFjv93ACGo8) | dense | — | — | — | — | — | **OOM** (335,967 tokens, 40,960 limit) |
+| VideoMME | AutoGaze | — | — | — | — | — | **OOM** (180 tiles — AutoGaze's own selector ran out of memory) |
+| VideoMME | codec | 26,567 | 1.0s | 25.8s* | 2.1s | 1.2s | **39.3s** |
+
+*codec's "selector" time includes its ~1s encode step (the transcode
+analog — codec only re-encodes the sampled frames, not the whole video, so
+it's much cheaper here than LLaVA-OV-2's whole-video H264 transcode).
+"Encode" and "Selector" together are what the reference table calls
+transcode + preprocess; AutoGaze's "Selector" is its own trained model's GPU
+forward pass, which has no analog in the frames-only baseline.
+
+Both baselines OOM outright at nvf=64 — not just slow, don't run at all.
+EgoSchema's video pushes dense mode to 92,392 tokens (40,960 limit); VideoMME
+pushes it to 335,967. VideoMME also has 180 tiles (vs. EgoSchema's 48, a
+wider-aspect video), which OOMs AutoGaze's *own* selector too — codec is the
+only one of the three that completes on that video at all. The token
+reduction AutoGaze/codec provide isn't just a latency win here, it's the
+difference between running and not running.
+
 ## Next Steps
 
 1. **Integrate NVDEC into codec mode — in progress.** A `codec_nvdec` backend
