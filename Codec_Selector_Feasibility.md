@@ -243,24 +243,41 @@ other dataset. GIFs are downsampled previews — captions link the full-res vide
 
 Same two videos as LLaVA-OV-2's own frames-vs-codec smoke test
 (`llava_onevision2_repro/SMOKE_TEST.md`, separate repo), run through this
-repo's pipeline at nvf=64 — different VLM, different selector, not a
-controlled comparison, just a rough cross-check with the same source videos.
+repo's pipeline — different VLM, different selector, not a controlled
+comparison, just a rough cross-check with the same source videos.
+
+**nvf=16** (this doc's usual comparison point) — all three complete cleanly:
 
 | Dataset | Mode | Tokens | Encode | Selector | ViT | LLM | E2E |
 |---|---|---:|---:|---:|---:|---:|---:|
-| EgoSchema (0074f737…, 180s) | dense | — | — | — | — | — | **OOM** (92,392 tokens, 40,960 limit) |
+| EgoSchema (0074f737…, 180s) | dense | 23,176 | — | — | 2.4s | 1.5s | **5.1s** |
+| EgoSchema | AutoGaze | **1,593** | — | 6.2s | 0.2s | 0.3s | 8.3s |
+| EgoSchema | codec | 2,555 | 0.3s | 4.9s* | 0.2s | 0.3s | 6.3s |
+| VideoMME (001-1, fFjv93ACGo8) | dense | 28,703 | — | — | 2.9s | 1.6s | 5.7s |
+| VideoMME | AutoGaze | **1,655** | — | 7.2s | 0.2s | 0.2s | 9.7s |
+| VideoMME | codec | 2,930 | 0.2s | 3.7s* | 0.3s | 0.3s | **5.3s** |
+
+At this frame count dense is fastest E2E despite ~15x more tokens — the ViT/LLM
+cost of those tokens is still cheaper than AutoGaze's own selector-model
+overhead (6-7s) at such a small budget. This matches Finding 1: the
+crossover where selection actually pays off starts around nvf=64-128, not 16.
+
+**nvf=64** — both baselines OOM outright, codec is the only one that runs:
+
+| Dataset | Mode | Tokens | Encode | Selector | ViT | LLM | E2E |
+|---|---|---:|---:|---:|---:|---:|---:|
+| EgoSchema | dense | — | — | — | — | — | **OOM** (92,392 tokens, 40,960 limit) |
 | EgoSchema | AutoGaze | 5,678 | — | 28.1s | 2.1s | 0.5s | **36.5s** |
 | EgoSchema | codec | 9,908 | 1.2s | 16.2s* | 0.8s | 0.5s | **20.4s** |
-| VideoMME (001-1, fFjv93ACGo8) | dense | — | — | — | — | — | **OOM** (335,967 tokens, 40,960 limit) |
+| VideoMME | dense | — | — | — | — | — | **OOM** (335,967 tokens, 40,960 limit) |
 | VideoMME | AutoGaze | — | — | — | — | — | **OOM** (180 tiles — AutoGaze's own selector ran out of memory) |
 | VideoMME | codec | 26,567 | 1.0s | 25.8s* | 2.1s | 1.2s | **39.3s** |
 
-*codec's "selector" time includes its ~1s encode step (the transcode
+*codec's "selector" column includes its own encode step (the transcode
 analog — codec only re-encodes the sampled frames, not the whole video, so
 it's much cheaper here than LLaVA-OV-2's whole-video H264 transcode).
-"Encode" and "Selector" together are what the reference table calls
-transcode + preprocess; AutoGaze's "Selector" is its own trained model's GPU
-forward pass, which has no analog in the frames-only baseline.
+AutoGaze's "selector" is its own trained model's GPU forward pass, which has
+no analog in the frames-only baseline.
 
 Both baselines OOM outright at nvf=64 — not just slow, don't run at all.
 EgoSchema's video pushes dense mode to 92,392 tokens (40,960 limit); VideoMME
