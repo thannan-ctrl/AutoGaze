@@ -266,6 +266,12 @@ those tokens is still cheaper than AutoGaze's own selector-model overhead
 (6-7s) at such a small budget. This matches Finding 1: the crossover where
 selection actually pays off starts around nvf=64-128, not 16.
 
+Confirmed at N=25/dataset (not just these two videos): dense stays fastest
+E2E at nvf=16 both places — 4.4s/5.1s (EgoSchema/VideoMME) vs. codec's
+5.6s/6.4s vs. AutoGaze's 8.1s/9.2s — matching Finding 1's full-dataset
+numbers closely (AutoGaze's own selector-model overhead is what keeps it
+slowest at this frame count, same story as N=1).
+
 ## Next Steps
 
 1. **Integrate NVDEC into codec mode — in progress.** A `codec_nvdec` backend
