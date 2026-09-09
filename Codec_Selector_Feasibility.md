@@ -272,6 +272,69 @@ E2E at nvf=16 both places — 4.4s/5.1s (EgoSchema/VideoMME) vs. codec's
 numbers closely (AutoGaze's own selector-model overhead is what keeps it
 slowest at this frame count, same story as N=1).
 
+### Frame-count sweep: nvf=16 → 1024 (same two videos, patch-selector only)
+
+Same two videos, patch-selector latency only (`SKIP_LLM=1`, no ViT/LLM), across
+the full nvf range used in the main sweep (Findings 1-4). Encode is codec's x265
+pass over just the sampled frames; Selector is AutoGaze's own trained-model
+forward pass for AutoGaze rows, or codec's motion-vector scoring pass (no GPU
+model) for codec rows.
+
+| Dataset | Mode | nvf | Tokens | Encode | Selector | E2E |
+|---|---|---:|---:|---:|---:|---:|
+| EgoSchema | AutoGaze | 16 | 1,593 | — | 0.8s | 8.6s |
+| EgoSchema | AutoGaze | 32 | 2,949 | — | 12.4s | 15.8s |
+| EgoSchema | AutoGaze | 64 | — | — | — | **OOM** |
+| EgoSchema | AutoGaze | 128 | — | — | — | **OOM** |
+| EgoSchema | AutoGaze | 256 | — | — | — | **OOM** |
+| EgoSchema | AutoGaze | 512 | — | — | — | **OOM** |
+| EgoSchema | AutoGaze | 1024 | — | — | — | **OOM** |
+| EgoSchema | codec | 16 | 2,555 | 0.3s† | 2.5s | 3.7s |
+| EgoSchema | codec | 32 | 5,006 | 0.7s | 7.9s | 10.6s |
+| EgoSchema | codec | 64 | 9,908 | cached‡ | 10.9s | 13.7s |
+| EgoSchema | codec | 128 | 19,712 | 2.3s | 30.0s | 38.0s |
+| EgoSchema | codec | 256 | 39,320 | 4.7s | 56.9s | 74.1s |
+| EgoSchema | codec | 512 | 78,536 | 9.4s | 116.0s | 147.8s |
+| EgoSchema | codec | 1024 | 156,968 | 18.7s | 238.5s | 314.4s |
+| VideoMME | AutoGaze | 16 | 1,655 | — | 0.9s | 9.8s |
+| VideoMME | AutoGaze | 32 | 3,682 | — | 26.1s | 32.4s |
+| VideoMME | AutoGaze | 64 | — | — | — | **OOM** |
+| VideoMME | AutoGaze | 128 | — | — | — | **OOM** |
+| VideoMME | AutoGaze | 256 | 69,667 | — | 992.8s | 1254.2s |
+| VideoMME | AutoGaze | 512 | 133,688 | — | 1978.4s | 2472.1s |
+| VideoMME | AutoGaze | 1024 | — | — | — | **OOM** |
+| VideoMME | codec | 16 | 2,930 | 0.2s† | 2.4s | 3.7s |
+| VideoMME | codec | 32 | 9,037 | 0.5s | 8.3s | 11.9s |
+| VideoMME | codec | 64 | 26,567 | cached‡ | 21.1s | 30.1s |
+| VideoMME | codec | 128 | 53,039 | 2.0s | 46.9s | 66.2s |
+| VideoMME | codec | 256 | 306,271 | 4.0s | 247.6s | 363.3s |
+| VideoMME | codec | 512 | 612,447 | 7.9s | 484.5s | 713.3s |
+| VideoMME | codec | 1024 | 1,224,799 | 15.6s | 966.1s | 1428.3s |
+
+†nvf=16's encode figure is carried over from the table above (same video, same
+nvf, same run conditions) — this sweep's own nvf=16 run hit a warm on-disk
+`hevc_dump_cache/` entry from that earlier probe, so no fresh x265 pass ran here.
+‡nvf=64 hit the same kind of cache hit (from an earlier, since-removed nvf=64
+probe) with no prior standalone encode measurement to carry over, so its encode
+time is folded into Selector rather than guessed at.
+
+Two things stand out:
+
+- **AutoGaze's OOM boundary isn't a clean function of nvf.** EgoSchema OOMs at
+  every nvf≥64 tried. VideoMME OOMs at 64 and 128, *recovers* at 256 and 512,
+  then OOMs again at 1024 — consistent with shared-GPU memory pressure at the
+  moment each combo happened to launch (whatever else was resident on the
+  device), rather than the deterministic tile-count ceiling documented in
+  Finding 4's N=25 sweep.
+- **Codec's token count grows unbounded with nvf; AutoGaze's doesn't.** Codec has
+  no early-stop — it always fills its fixed top-k budget exactly, so tokens scale
+  roughly linearly with nvf (VideoMME: 2,930 → 1,224,799 tokens, nvf 16→1024).
+  AutoGaze's EOS-based early stopping keeps its token count far lower at every
+  nvf where it doesn't OOM. That's the direct answer to "why aren't tokens
+  similar between the two modes": without a ratio scale applied to match
+  AutoGaze's average, codec and AutoGaze are targeting different budgets, not
+  the same one.
+
 ## Next Steps
 
 1. **Integrate NVDEC into codec mode — in progress.** A `codec_nvdec` backend

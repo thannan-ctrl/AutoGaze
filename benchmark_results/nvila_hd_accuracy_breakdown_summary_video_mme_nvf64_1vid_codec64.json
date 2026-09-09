@@ -1,0 +1,22 @@
+{
+  "codec": {
+    "n": 1,
+    "correct": 0,
+    "accuracy": 0.0,
+    "avg_e2e_ms": 30060.636281967163,
+    "avg_preproc_ms": 30060.636281967163,
+    "avg_decode_ms": 89.71524238586426,
+    "avg_image_preproc_ms": 8728.904724121094,
+    "avg_autogaze_ops_ms": 21138.217210769653,
+    "avg_autogaze_model_ms": 0.0,
+    "avg_other_ms": 103.79910469055176,
+    "avg_cpu_ms": 30060.636281967163,
+    "avg_gpu_ms": 0.0,
+    "avg_vit_ms": 0.0,
+    "avg_llm_ms": 0.0,
+    "avg_llm_prefill_ms": 0.0,
+    "avg_llm_decode_ms": 0.0,
+    "avg_llm_calls": 0.0,
+    "avg_num_tokens": 26567.0
+  }
+}
