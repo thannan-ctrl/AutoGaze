@@ -1,6 +1,8 @@
-"""Convert Samuel Eadie's hevc_dump CSV (HEVC CU partition/motion-vector dump,
-https://gitlab-master.nvidia.com/seadie/hevc_dump) into AutoGaze's gazing-info
-JSON format consumed by autogaze.datasets.video_folder.VideoFolder:
+"""Convert HEVC CU partition/motion-vector statistics into AutoGaze scores.
+
+The production codec selector consumes hevc_dump's compact binary stream;
+the command-line converter below retains support for legacy YUView CSV. Its
+JSON output is consumed by autogaze.datasets.video_folder.VideoFolder:
 
     {video_path: {"gazing_pos": [[patch_idx, ...] per frame],
                   "task_losses": [[float, ...] per frame]}}
@@ -27,13 +29,72 @@ import argparse
 import csv
 import json
 import os
+import struct
 import subprocess
 from collections import defaultdict
+
+import numpy as np
 
 PRED_MODE, PART_MODE, QP, INTRA_PRED_MODE, MV_L0, MV_L1 = range(6)
 SKIP = 2
 MAX_CU_SIZE = 64  # HEVC max CTU side length
 NVDEC_CU_SIZE = 16  # NVDEC decode-stats grid (CUVIDDECODESTATS is per 16x16)
+
+# Compact output produced by scripts/hevc_dump/dump_stats.cc --binary.  Keep
+# this format fixed-width so Python can view all blocks with np.frombuffer,
+# without text conversion or one dictionary allocation per CSV row.
+BLOCK_STATS_MAGIC = b"AGCUBIN1"
+BLOCK_STATS_VERSION = 1
+BLOCK_STATS_FILE_HEADER = struct.Struct("<8sIII")  # magic, version, width, height
+BLOCK_STATS_FRAME_HEADER = struct.Struct("<iI")   # POC, number of blocks
+BLOCK_STATS_DTYPE = np.dtype(
+    [
+        ("x", "<i4"), ("y", "<i4"), ("w", "<i4"), ("h", "<i4"),
+        ("mv0_x", "<i2"), ("mv0_y", "<i2"),
+        ("mv1_x", "<i2"), ("mv1_y", "<i2"),
+        ("pred_mode", "u1"), ("flags", "u1"), ("reserved", "<u2"),
+    ],
+    align=False,
+)
+MV0_VALID = 1
+MV1_VALID = 2
+
+
+def parse_block_stats_binary(blob):
+    """Return ``(width, height, {poc: structured_block_array})``.
+
+    Arrays are zero-copy views into ``blob``.  Callers that retain the arrays
+    must therefore retain the returned mapping (whose arrays keep a reference
+    to the backing immutable bytes object).
+    """
+    view = memoryview(blob)
+    if len(view) < BLOCK_STATS_FILE_HEADER.size:
+        raise ValueError("truncated block-stats binary header")
+    magic, version, width, height = BLOCK_STATS_FILE_HEADER.unpack_from(view, 0)
+    if magic != BLOCK_STATS_MAGIC:
+        raise ValueError(f"bad block-stats magic {magic!r}")
+    if version != BLOCK_STATS_VERSION:
+        raise ValueError(
+            f"unsupported block-stats version {version}; expected {BLOCK_STATS_VERSION}"
+        )
+
+    offset = BLOCK_STATS_FILE_HEADER.size
+    by_poc = {}
+    while offset < len(view):
+        if len(view) - offset < BLOCK_STATS_FRAME_HEADER.size:
+            raise ValueError("truncated block-stats frame header")
+        poc, n_blocks = BLOCK_STATS_FRAME_HEADER.unpack_from(view, offset)
+        offset += BLOCK_STATS_FRAME_HEADER.size
+        nbytes = int(n_blocks) * BLOCK_STATS_DTYPE.itemsize
+        if len(view) - offset < nbytes:
+            raise ValueError(
+                f"truncated block-stats frame {poc}: need {nbytes} bytes, "
+                f"have {len(view) - offset}"
+            )
+        blocks = np.frombuffer(view, dtype=BLOCK_STATS_DTYPE, count=n_blocks, offset=offset)
+        offset += nbytes
+        by_poc[poc] = blocks
+    return int(width), int(height), by_poc
 
 
 def _rows_to_cus(rows):
@@ -96,6 +157,24 @@ def score_cu(cu, w_motion, skip_penalty):
     return score
 
 
+def score_block_array(blocks, w_motion, skip_penalty):
+    """Vectorized equivalent of :func:`score_cu` for compact binary blocks."""
+    if not len(blocks):
+        return np.empty(0, dtype=np.float32)
+    area = blocks["w"].astype(np.float32) * blocks["h"].astype(np.float32)
+    size_score = 1.0 - np.minimum(area, float(MAX_CU_SIZE**2)) / float(MAX_CU_SIZE**2)
+
+    flags = blocks["flags"]
+    mv0 = np.hypot(blocks["mv0_x"].astype(np.float32), blocks["mv0_y"].astype(np.float32))
+    mv1 = np.hypot(blocks["mv1_x"].astype(np.float32), blocks["mv1_y"].astype(np.float32))
+    mv0 = np.where((flags & MV0_VALID) != 0, mv0, 0.0)
+    mv1 = np.where((flags & MV1_VALID) != 0, mv1, 0.0)
+    score = size_score + np.float32(w_motion) * np.minimum(np.maximum(mv0, mv1) / 256.0, 1.0)
+    return np.where(
+        blocks["pred_mode"] == SKIP, score * np.float32(skip_penalty), score
+    ).astype(np.float32, copy=False)
+
+
 def score_cu_grid(cu_type, mv0_x, mv0_y, mv1_x, mv1_y, w_motion, skip_penalty, cu_size=NVDEC_CU_SIZE):
     """Vectorized `score_cu` for a regular `cu_size` x `cu_size` grid (NVDEC's
     flattened 16x16 decode-stats layout). Arrays are (mh, mw); output is too.
@@ -104,14 +183,14 @@ def score_cu_grid(cu_type, mv0_x, mv0_y, mv1_x, mv1_y, w_motion, skip_penalty, c
     ranking within a frame is motion + skip only -- same formula as `score_cu`,
     just no per-CU partition geometry.
     """
-    import numpy as np
-
     size_score = 1.0 - min(cu_size * cu_size, MAX_CU_SIZE**2) / (MAX_CU_SIZE**2)
-    mv0 = np.hypot(np.asarray(mv0_x, dtype=np.float64), np.asarray(mv0_y, dtype=np.float64))
-    mv1 = np.hypot(np.asarray(mv1_x, dtype=np.float64), np.asarray(mv1_y, dtype=np.float64))
-    motion_score = w_motion * np.minimum(np.maximum(mv0, mv1) / 256.0, 1.0)
-    score = size_score + motion_score
-    return np.where(np.asarray(cu_type) == SKIP, score * skip_penalty, score)
+    mv0 = np.hypot(np.asarray(mv0_x, dtype=np.float32), np.asarray(mv0_y, dtype=np.float32))
+    mv1 = np.hypot(np.asarray(mv1_x, dtype=np.float32), np.asarray(mv1_y, dtype=np.float32))
+    motion_score = np.float32(w_motion) * np.minimum(np.maximum(mv0, mv1) / 256.0, 1.0)
+    score = np.float32(size_score) + motion_score
+    return np.where(
+        np.asarray(cu_type) == SKIP, score * np.float32(skip_penalty), score
+    ).astype(np.float32, copy=False)
 
 
 def upsample_cu_grid(grid, frame_w, frame_h, cu_size=NVDEC_CU_SIZE):
@@ -129,25 +208,26 @@ def pool_score_map(score_map, grid_size):
     """Area-average-pool a 2D score map to grid_size x grid_size via an integral
     image (exact even when the map's dimensions don't divide evenly into
     grid_size)."""
-    import numpy as np
-
     h, w = score_map.shape
+    # Keep the original implementation's float64 integral-image storage so
+    # this loop removal does not introduce an additional precision loss.
     integral = np.zeros((h + 1, w + 1), dtype=np.float64)
     integral[1:, 1:] = np.cumsum(np.cumsum(score_map, axis=0), axis=1)
 
-    grid = np.zeros((grid_size, grid_size), dtype=np.float64)
-    for r in range(grid_size):
-        y0 = round(r * h / grid_size)
-        y1 = round((r + 1) * h / grid_size)
-        for c in range(grid_size):
-            x0 = round(c * w / grid_size)
-            x1 = round((c + 1) * w / grid_size)
-            total = (
-                integral[y1, x1] - integral[y0, x1] - integral[y1, x0] + integral[y0, x0]
-            )
-            area = max((y1 - y0) * (x1 - x0), 1)
-            grid[r, c] = total / area
-    return grid
+    # All grid cells can be read from the integral image in one advanced-index
+    # operation.  This is exactly the former nested loop's rounding/math.
+    edges_y = np.rint(np.arange(grid_size + 1) * h / grid_size).astype(np.intp)
+    edges_x = np.rint(np.arange(grid_size + 1) * w / grid_size).astype(np.intp)
+    y0, y1 = edges_y[:-1], edges_y[1:]
+    x0, x1 = edges_x[:-1], edges_x[1:]
+    total = (
+        integral[y1[:, None], x1[None, :]]
+        - integral[y0[:, None], x1[None, :]]
+        - integral[y1[:, None], x0[None, :]]
+        + integral[y0[:, None], x0[None, :]]
+    )
+    area = np.maximum((y1 - y0)[:, None] * (x1 - x0)[None, :], 1)
+    return total / area
 
 
 def build_frame_score_map(cus, frame_w, frame_h):
@@ -163,6 +243,30 @@ def build_frame_score_map(cus, frame_w, frame_h):
         x0, x1 = cu["x"], min(cu["x"] + cu["w"], frame_w)
         score_map[y0:y1, x0:x1] = score
     return score_map
+
+
+def build_frame_score_map_from_blocks(blocks, scores, frame_w, frame_h):
+    """Paint compact structured block records without constructing CU dicts."""
+    score_map = np.zeros((frame_h, frame_w), dtype=np.float32)
+    for block, score in zip(blocks, scores):
+        y0 = int(block["y"])
+        x0 = int(block["x"])
+        y1 = min(y0 + int(block["h"]), frame_h)
+        x1 = min(x0 + int(block["w"]), frame_w)
+        score_map[y0:y1, x0:x1] = score
+    return score_map
+
+
+def topk_sorted_indices(scores, k):
+    """Select top-k scores in O(n), then return indices in model order."""
+    flat = np.asarray(scores).reshape(-1)
+    k = min(max(int(k), 0), flat.size)
+    if k == 0:
+        return np.empty(0, dtype=np.int64)
+    if k == flat.size:
+        return np.arange(flat.size, dtype=np.int64)
+    chosen = np.argpartition(-flat, k - 1)[:k]
+    return np.sort(chosen.astype(np.int64, copy=False))
 
 
 def rasterize_to_grid(cus, frame_w, frame_h, grid_size):

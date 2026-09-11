@@ -5,10 +5,9 @@ frame count, and rejects elementary streams. This module uses the core
 CreateDemuxer + CreateDecoder path instead, which walks packets forward and
 does not assume a seekable container.
 
-Tried in order:
-  1. CreateDemuxer(callback) -- documented non-seekable / streaming path
-  2. CreateDemuxer(filename=path) -- FFmpeg sequential demux (works for
-     Annex-B .hevc as well as mp4); used if the callback constructor fails
+Demuxing tries ``CreateDemuxer(filename=path)`` first, avoiding Python callback
+and buffer-copy overhead. The documented callback path remains a fallback for
+inputs the filename constructor cannot open.
 """
 from __future__ import annotations
 
@@ -21,6 +20,10 @@ import numpy as np
 from scripts import hevc_to_gaze as h2g
 
 _STATS_KEYS = ("qp_luma", "cu_type", "mv0_x", "mv0_y", "mv1_x", "mv1_y")
+
+
+class UnsupportedDecodeStatsCodec(RuntimeError):
+    """The input codec cannot provide NVDEC block statistics."""
 
 
 def import_pynv():
@@ -129,24 +132,24 @@ def _create_decoder(nvc, codec, gpu_id):
 
 
 def _create_demuxer(nvc, path):
-    """Prefer a non-seekable callback demuxer; fall back to filename demux.
+    """Prefer FFmpeg's native filename demuxer; fall back to a callback.
 
-    CreateDemuxer is FFmpeg-side (no GPU). Any callback constructor failure
-    is retried with a path so Annex-B files can still probe via extension.
+    The callback path is useful for non-seekable inputs, but for an ordinary
+    file it adds Python callbacks and a bytes-to-demux-buffer copy.
     """
-    feeder = _ForwardFile(path)
-    try:
-        return nvc.CreateDemuxer(feeder.feed_chunk), feeder
-    except Exception:
-        feeder.close()
-
     last = None
     for args, kwargs in (((), {"filename": path}), ((path,), {})):
         try:
             return nvc.CreateDemuxer(*args, **kwargs), None
-        except TypeError as e:
+        except Exception as e:
             last = e
-    raise TypeError(f"CreateDemuxer rejected path {path!r}; last error: {last}") from last
+
+    feeder = _ForwardFile(path)
+    try:
+        return nvc.CreateDemuxer(feeder.feed_chunk), feeder
+    except Exception as e:
+        feeder.close()
+        raise TypeError(f"CreateDemuxer rejected path {path!r}; last error: {e or last}") from e
 
 
 def _codec_id(demuxer):
@@ -155,6 +158,34 @@ def _codec_id(demuxer):
         if callable(fn):
             return fn()
     raise RuntimeError("demuxer has no GetNvCodecId()")
+
+
+def _close_demuxer(demuxer, feeder):
+    if feeder is not None:
+        feeder.close()
+    close = getattr(demuxer, "close", None)
+    if callable(close):
+        close()
+
+
+def _require_stats_codec(nvc, codec):
+    """Reject codecs other than H.264/HEVC before creating an NVDEC session."""
+    enum = getattr(nvc, "cudaVideoCodec", None)
+    supported = []
+    if enum is not None:
+        for name in ("H264", "HEVC"):
+            value = getattr(enum, name, None)
+            if value is not None:
+                supported.append(value)
+    if supported and codec in supported:
+        return
+
+    label = str(codec).lower().replace(".", "").replace("_", "")
+    if "h264" in label or "avc" in label or "hevc" in label or "h265" in label:
+        return
+    raise UnsupportedDecodeStatsCodec(
+        f"NVDEC decode statistics support H.264/HEVC, not codec {codec!r}"
+    )
 
 
 def _loaded_extension():
@@ -247,11 +278,16 @@ def dump_nvdec_grids(
     include_qp=False,
     verbose=False,
     timings=None,
+    keep_frames=None,
+    require_stats_codec=False,
 ):
     """Decode `path` sequentially and return per-display-frame 16x16 grids.
 
-    Each dict has cu_type / mv0_x / mv0_y / mv1_x / mv1_y (and qp_luma if
-    include_qp and the field is present). Pixels are discarded.
+    Each retained dict has cu_type / mv0_x / mv0_y / mv1_x / mv1_y (and
+    qp_luma if requested). Pixels are discarded. If ``keep_frames`` is given,
+    non-selected display frames are still decoded for reference dependencies,
+    but their statistics are neither parsed nor copied to NumPy; their result
+    entry is ``None`` so list indices remain display-frame indices.
 
     If `timings` is a dict, it is filled with demuxer_ms / decoder_ms /
     decode_ms / teardown_ms (CreateDecoder is usually the 4-frame bottleneck).
@@ -264,10 +300,20 @@ def dump_nvdec_grids(
     t0 = time.perf_counter()
     demuxer, feeder = _create_demuxer(nvc, path)
     codec = _codec_id(demuxer)
+    if require_stats_codec:
+        try:
+            _require_stats_codec(nvc, codec)
+        except Exception:
+            _close_demuxer(demuxer, feeder)
+            raise
     _stamp("demuxer_ms", t0)
 
     t0 = time.perf_counter()
-    decoder = _create_decoder(nvc, codec, gpu_id)
+    try:
+        decoder = _create_decoder(nvc, codec, gpu_id)
+    except Exception:
+        _close_demuxer(demuxer, feeder)
+        raise
     _stamp("decoder_ms", t0)
     if verbose:
         print(describe_nvdec_env(nvc, gpu_id, codec))
@@ -281,13 +327,21 @@ def dump_nvdec_grids(
     )
     grids = []
     printed = False
+    keep_frames = None if keep_frames is None else {int(i) for i in keep_frames}
+    parsed_frames = 0
 
     def _take_frame(frame):
-        nonlocal printed
+        nonlocal printed, parsed_frames
+        frame_index = len(grids)
+        if keep_frames is not None and frame_index not in keep_frames:
+            grids.append(None)
+            return max_frames is not None and len(grids) >= max_frames
+
         size = getattr(frame, "decode_stats_size", 0)
         if size <= 0:
             raise _no_stats_error(path, nvc, gpu_id, codec, demuxer)
         stats = _as_stats_dict(frame.ParseDecodeStats())
+        parsed_frames += 1
         if verbose and not printed:
             printed = True
             keys = {k: (np.asarray(v).shape, str(np.asarray(v).dtype)) for k, v in stats.items()}
@@ -297,7 +351,7 @@ def dump_nvdec_grids(
         def _grid(name, dtype):
             if name not in stats:
                 return zero.astype(dtype, copy=True)
-            return as_mb_grid(stats[name], width, height).astype(dtype, copy=False)
+            return as_mb_grid(np.asarray(stats[name], dtype=dtype), width, height)
 
         rec = {
             "cu_type": _grid("cu_type", np.uint8),
@@ -332,12 +386,13 @@ def dump_nvdec_grids(
     finally:
         _stamp("decode_ms", t0)
         t1 = time.perf_counter()
-        if feeder is not None:
-            feeder.close()
-        for obj in (decoder, demuxer):
-            close = getattr(obj, "close", None)
-            if callable(close):
-                close()
+        close = getattr(decoder, "close", None)
+        if callable(close):
+            close()
+        _close_demuxer(demuxer, feeder)
         del decoder, demuxer
         _stamp("teardown_ms", t1)
+    if timings is not None:
+        timings["frames_decoded"] = len(grids)
+        timings["frames_parsed"] = parsed_frames
     return grids

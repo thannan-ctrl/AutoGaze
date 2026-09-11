@@ -58,10 +58,19 @@ VideoMME subset (1395 of 2700 questions).
 
 
 ### NVDEC vs Software Codec Implementations
-The NVDEC hardware implementation provides a significant speed-up over a naive software decoder, but requires an NVDEC core, driver version >= 610 and CUDA >=13.1 (https://docs.nvidia.com/video-technologies/video-codec-sdk/13.1/read-me/index.html#:~:text=or%20higher%20Toolkit-,Linux,CUDA%2013.1%20or%20higher%20Toolkit,-Jetson%20Linux). 
+The NVDEC hardware implementation provides a significant speed-up over a software decoder, but requires an NVDEC core and a driver/toolkit combination that supports Video Codec SDK 13.1 decode statistics (https://docs.nvidia.com/video-technologies/video-codec-sdk/13.1/read-me/index.html).
 Profiling on a 1080x1920, 130-frame sequence to compare runtimes of the two codec implementations. Note, CreateDemuxer, CreateDecoder, and teardown are largely fixed runtimes regardless of the number of frames decoded, so while NVDEC is asymptotically >100x faster, the actual speedup depends on number of frames decoded.
 
-#### "codec" (original implementation)
+The table below records the legacy implementation. The current `codec` path
+replaces YUV+CSV+grep with target-only compact binary output and zero-copy
+parsing. The current `codec_nvdec` path reads H.264/HEVC inputs directly,
+retains decoded pixels on the GPU, parses/copies statistics only for sampled
+frames, keeps cold results in memory, and writes an uncompressed `.npz` cache
+asynchronously. Set `CODEC_PERSIST_CACHE=0` to disable disk persistence,
+`CODEC_COMPRESS_CACHE=1` to trade CPU time for cache size, or
+`CODEC_NVDEC_SOURCE_MODE=off` to force the controlled windowed-x265 fallback.
+
+#### "codec" (legacy implementation)
 ```
 phase                       mean_ms   std_ms  min_ms    max_ms    n
 --------------------------  --------  ------  --------  --------  -
@@ -185,4 +194,3 @@ autoregressive, frame-by-frame decision process. One proposal to close that gap:
 autoregressive model's per-frame decisions, trading the 16 sequential steps for 1.
 
 <img src="assets/nvf16_summary_plots/autogaze_student_distillation_proposal.png" alt="AutoGaze student distillation proposal" width="600">
-

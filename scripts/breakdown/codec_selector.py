@@ -9,40 +9,41 @@ from the loaded `processing_nvila` module, not reimplemented -- so patch indices
 up with what the real pipeline would produce for the same video_path/config. See
 Codec_Selector_Feasibility.md for the full architecture writeup.
 
-WINDOWED ENCODING (not full-video): only ~num_video_frames * (WINDOW+1) real frames
-are ever decoded/encoded/dumped, not the whole video. Each needed frame gets a short
-window of real, temporally-adjacent context (WINDOW frames before it) so motion
-vectors stay meaningful, with an explicit I-frame forced at each window's start so
-no motion/prediction data crosses window boundaries. This replaced an earlier
-full-video re-encode (needed, it was believed, for POC alignment) that cost
-~140-160s/video; windowed encoding costs ~2s/video by only touching the ~1-2% of
-frames actually scored. Since we now choose exactly which real frame maps to which
-artificial-stream POC (`poc_map`), the old "does POC == cv2-frame-index" assumption
-this module used to carry is no longer a risk -- the mapping is explicit and correct
-by construction rather than assumed.
+SOURCE HANDLING: ``codec_nvdec`` decodes H.264/HEVC inputs directly by default, so
+it performs no CPU pixel decode or x265 transcode. Other codecs fall back to the
+controlled windowed HEVC stream used by ``codec``. That fallback makes one
+sequential source-decode pass but keeps only WINDOW+1 native-YUV frames live and
+encodes only ~num_video_frames * (WINDOW+1) frames. Each target gets real temporal
+context and an explicit I-frame at the window boundary. ``poc_map`` records the
+target POC in this artificial stream explicitly.
 
 Backends:
-  libde265 ("codec")     -- dump_stats walks the true CU quad-tree, writes a
-                            YUView CSV, then we grep/parse it back. Ground truth
-                            partition geometry, slow plumbing.
-  nvdec ("codec_nvdec")  -- same windowed x265 Annex-B encode, then sequential
-                            NVDEC decode-stats (CreateDemuxer + CreateDecoder)
-                            on a regular 16x16 grid, kept as in-memory numpy
-                            (cached as .npz). Scores and token selection stay
-                            on that grid (pixel crop boxes are mapped into
-                            CU-cell space)
+  libde265 ("codec")     -- dump_stats walks the true CU quad-tree and returns
+                            only target POCs in a compact binary stream. NumPy
+                            views that stream without CSV/text conversion.
+  nvdec ("codec_nvdec")  -- sequential NVDEC decode-stats on a regular 16x16
+                            grid. Decoded pixels remain in device memory and are
+                            discarded; only selected, small stats grids cross to
+                            NumPy. Optional .npz persistence runs asynchronously.
 """
 import functools
 import hashlib
 import os
 import platform
+import subprocess
 import sys
+import threading
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
+from fractions import Fraction
 
 import cv2
 import numpy as np
 import torch
 
 WINDOW = 4  # real frames of context before each scored frame (5 frames/window total)
+CACHE_FORMAT_VERSION = 2
+_MEMORY_CACHE_SIZE = 8
 
 _REPO_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_DIR not in sys.path:
@@ -61,15 +62,53 @@ DUMP_STATS_BIN = os.path.join(_REPO_DIR, "scripts", "hevc_dump", _BUILD_DIR, "du
 CACHE_DIR = os.path.join(_REPO_DIR, "data", "hevc_dump_cache")
 NVDEC_CACHE_DIR = os.path.join(_REPO_DIR, "data", "hevc_nvdec_cache")
 
-# Benchmark mode name -> dump backend. "codec" keeps the original libde265/CSV
-# path; "codec_nvdec" is the NVDEC 16x16 variant.
+# Benchmark mode name -> dump backend.
 BACKEND_FOR_MODE = {"codec": "libde265", "codec_nvdec": "nvdec"}
 
+_CACHE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="codec-cache")
+_LIB_MEMORY_CACHE = OrderedDict()
+_NVDEC_MEMORY_CACHE = OrderedDict()
 
-def _video_key(video_path: str, frame_indices) -> str:
+
+def _remember(cache, key, value):
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > _MEMORY_CACHE_SIZE:
+        cache.popitem(last=False)
+
+
+def _atomic_write_bytes(path, payload):
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(payload)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _persist_bytes(path, payload):
+    if os.environ.get("CODEC_PERSIST_CACHE", "1") != "0":
+        _CACHE_EXECUTOR.submit(_atomic_write_bytes, path, payload)
+
+
+def _video_key(video_path: str, frame_indices, variant: str = "libde265") -> str:
     st = os.stat(video_path)
-    frames_key = hashlib.sha1(str(sorted(set(frame_indices))).encode()).hexdigest()[:8]
-    return hashlib.sha1(f"{video_path}:{st.st_size}:{st.st_mtime_ns}".encode()).hexdigest()[:16] + "_" + frames_key
+    normalized_indices = sorted(set(int(i) for i in frame_indices))
+    frames_key = hashlib.sha1(str(normalized_indices).encode()).hexdigest()[:8]
+    source = f"v{CACHE_FORMAT_VERSION}:{variant}:{video_path}:{st.st_size}:{st.st_mtime_ns}"
+    return hashlib.sha1(source.encode()).hexdigest()[:16] + "_" + frames_key
+
+
+def _window_poc_map(frame_indices):
+    """Deterministic target POCs for the concatenated context windows."""
+    poc_map = {}
+    next_poc = 0
+    for index in sorted(set(int(i) for i in frame_indices)):
+        next_poc += min(int(index), WINDOW) + 1
+        poc_map[int(index)] = next_poc - 1
+    return poc_map, next_poc
 
 
 def _extract_and_encode_windows(video_path: str, frame_indices, hevc_path: str, container: str = "hevc"):
@@ -86,30 +125,27 @@ def _extract_and_encode_windows(video_path: str, frame_indices, hevc_path: str, 
     `container` is the PyAV output format. Both dump backends consume Annex-B
     (`hevc`); mp4 is not required.
 
-    Returns (width, height, poc_map) where poc_map maps original cv2 frame
-    index -> POC in the encoded stream (sequential 0..N-1 in window order).
+    Returns ``(width, height, poc_map, encoded_frame_count)``. ``poc_map`` maps
+    each target source index to its display POC in the encoded stream.
     """
     import av
     from av.video.frame import PictureType
 
+    frame_indices = [int(i) for i in frame_indices]
+    if not frame_indices:
+        raise ValueError("frame_indices must not be empty")
+    if frame_indices != sorted(frame_indices):
+        raise ValueError("frame_indices must be in nondecreasing display order")
+    if frame_indices[0] < 0:
+        raise ValueError("frame_indices must be non-negative")
+    # np.linspace sampling can repeat indices for very short inputs. One stats
+    # record is sufficient for every repeated occurrence downstream.
+    frame_indices = sorted(set(frame_indices))
     windows = [list(range(max(0, idx - WINDOW), idx + 1)) for idx in frame_indices]
-    needed = sorted({i for win in windows for i in win})
 
     src = av.open(video_path)
     vs = src.streams.video[0]
     w, h = vs.codec_context.width, vs.codec_context.height
-    needed_set = set(needed)
-    max_needed = max(needed)
-    frames_by_idx = {}
-    frame_i = 0
-    for frame in src.decode(vs):
-        if frame_i in needed_set:
-            frames_by_idx[frame_i] = frame.to_ndarray(format="rgb24")
-        if frame_i >= max_needed:
-            break
-        frame_i += 1
-    src.close()
-
     out = av.open(hevc_path, mode="w", format=container)
     enc = out.add_stream("libx265", rate=25)
     enc.width, enc.height = w, h
@@ -126,52 +162,115 @@ def _extract_and_encode_windows(video_path: str, frame_indices, hevc_path: str, 
     enc.options = {"x265-params": "qp=27:pools=8:scenecut=0", "preset": "superfast"}
     poc_map = {}
     new_poc = 0
-    for win in windows:
-        for j, i in enumerate(win):
-            vf = av.VideoFrame.from_ndarray(frames_by_idx[i], format="rgb24")
-            if j == 0:
-                vf.pict_type = PictureType.I
-            for packet in enc.encode(vf):
-                out.mux(packet)
-            poc_map[i] = new_poc
-            new_poc += 1
-    for packet in enc.encode():
-        out.mux(packet)
-    out.close()
-    return w, h, poc_map
+    target_i = 0
+    ring = deque(maxlen=WINDOW + 1)
+    try:
+        for frame_i, frame in enumerate(src.decode(vs)):
+            # Retain the decoder's native YUV frame rather than converting every
+            # selected frame to RGB and back to YUV for x265.  Only WINDOW+1
+            # frames are live at a time.
+            ring.append(frame.reformat(format="yuv420p"))
+            while target_i < len(windows) and frame_i == frame_indices[target_i]:
+                win = windows[target_i]
+                local_frames = list(ring)[-len(win):]
+                if len(local_frames) != len(win):
+                    raise RuntimeError(
+                        f"missing context for frame {frame_indices[target_i]}: "
+                        f"wanted {len(win)}, got {len(local_frames)}"
+                    )
+                for j, vf in enumerate(local_frames):
+                    vf.pts = new_poc
+                    vf.time_base = Fraction(1, 25)
+                    vf.pict_type = PictureType.I if j == 0 else PictureType.NONE
+                    for packet in enc.encode(vf):
+                        out.mux(packet)
+                    new_poc += 1
+                # Only target POCs are needed downstream. Context frames remain
+                # in the bitstream solely to establish meaningful prediction.
+                poc_map[frame_indices[target_i]] = new_poc - 1
+                target_i += 1
+            if target_i == len(windows):
+                break
+        if target_i != len(windows):
+            raise RuntimeError(
+                f"video ended after satisfying {target_i}/{len(windows)} requested frames"
+            )
+        for packet in enc.encode():
+            out.mux(packet)
+    finally:
+        out.close()
+        src.close()
+    return w, h, poc_map, new_poc
 
 
 def get_or_build_stats(video_path: str, frame_indices):
-    """Return (csv_path, width, height, poc_map) for a video's hevc_dump CSV,
-    windowed-encoding + dumping it once and caching by (path, size, mtime,
-    frame_indices)."""
+    """Return compact libde265 block stats, without YUV or CSV plumbing."""
+    target_indices = sorted(set(int(i) for i in frame_indices))
+    if not target_indices:
+        raise ValueError("frame_indices must not be empty")
+    if target_indices[0] < 0:
+        raise ValueError("frame_indices must be non-negative")
     os.makedirs(CACHE_DIR, exist_ok=True)
-    key = _video_key(video_path, frame_indices)
-    csv_path = os.path.join(CACHE_DIR, f"{key}.csv")
-    meta_path = os.path.join(CACHE_DIR, f"{key}.meta")
-    pocmap_path = os.path.join(CACHE_DIR, f"{key}.pocmap")
-    if os.path.exists(csv_path) and os.path.exists(meta_path) and os.path.exists(pocmap_path):
-        with open(meta_path) as f:
-            w, h = (int(x) for x in f.read().split(","))
-        with open(pocmap_path) as f:
-            poc_map = dict(tuple(int(x) for x in line.split(",")) for line in f if line.strip())
-        return csv_path, w, h, poc_map
+    key = _video_key(video_path, target_indices, variant="libde265-binary")
+    stats_path = os.path.join(CACHE_DIR, f"{key}.agcu")
+    if stats_path in _LIB_MEMORY_CACHE or os.path.exists(stats_path):
+        w, h, _by_poc = _load_lib_stats(stats_path)
+        poc_map, _n_stream_frames = _window_poc_map(target_indices)
+        return stats_path, w, h, poc_map
 
     hevc_path = os.path.join(CACHE_DIR, f"{key}.hevc")
-    w, h, poc_map = _extract_and_encode_windows(video_path, frame_indices, hevc_path)
+    try:
+        w, h, poc_map, n_stream_frames = _extract_and_encode_windows(
+            video_path, target_indices, hevc_path
+        )
+        expected_poc_map, expected_n_frames = _window_poc_map(target_indices)
+        if poc_map != expected_poc_map or n_stream_frames != expected_n_frames:
+            raise RuntimeError("windowed encoder produced an inconsistent POC mapping")
+        target_pocs = sorted(set(poc_map.values()))
+        threads = int(os.environ.get("CODEC_LIBDE265_THREADS", min(os.cpu_count() or 1, 8)))
+        proc = subprocess.run(
+            [
+                DUMP_STATS_BIN,
+                hevc_path,
+                "--binary",
+                "--pocs", ",".join(str(p) for p in target_pocs),
+                "--threads", str(max(threads, 0)),
+            ],
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"dump_stats failed on {video_path} (exit {proc.returncode}): {err}"
+            )
+        blob = proc.stdout
+        parsed_w, parsed_h, by_poc = h2g.parse_block_stats_binary(blob)
+        if (parsed_w, parsed_h) != (w, h):
+            raise RuntimeError(
+                f"libde265 reported {parsed_w}x{parsed_h}, expected {w}x{h}"
+            )
+        missing = set(target_pocs) - set(by_poc)
+        if missing:
+            raise RuntimeError(f"libde265 did not return target POCs {sorted(missing)}")
+        _remember(_LIB_MEMORY_CACHE, stats_path, (blob, w, h, by_poc))
+        _persist_bytes(stats_path, blob)
+        return stats_path, w, h, poc_map
+    finally:
+        if os.path.exists(hevc_path):
+            os.remove(hevc_path)
 
-    yuv_path = os.path.join(CACHE_DIR, f"{key}.yuv")
-    ret = os.system(f'"{DUMP_STATS_BIN}" "{hevc_path}" "{yuv_path}" "{csv_path}"')
-    if ret != 0:
-        raise RuntimeError(f"dump_stats failed on {video_path} (exit code {ret})")
-    if os.path.exists(yuv_path):
-        os.remove(yuv_path)
-    with open(meta_path, "w") as f:
-        f.write(f"{w},{h}")
-    with open(pocmap_path, "w") as f:
-        for real_idx, stream_poc in poc_map.items():
-            f.write(f"{real_idx},{stream_poc}\n")
-    return csv_path, w, h, poc_map
+
+def _load_lib_stats(stats_path):
+    cached = _LIB_MEMORY_CACHE.get(stats_path)
+    if cached is not None:
+        _LIB_MEMORY_CACHE.move_to_end(stats_path)
+        return cached[1], cached[2], cached[3]
+    with open(stats_path, "rb") as f:
+        blob = f.read()
+    w, h, by_poc = h2g.parse_block_stats_binary(blob)
+    _remember(_LIB_MEMORY_CACHE, stats_path, (blob, w, h, by_poc))
+    return w, h, by_poc
 
 
 def _gpu_id() -> int:
@@ -184,106 +283,208 @@ def _gpu_id() -> int:
     return int(dev) if str(dev).isdigit() else 0
 
 
-def _nvdec_dump_grids(hevc_path: str, width: int, height: int):
-    """Decode `hevc_path` sequentially with NVDEC and return per-display-frame
+def _nvdec_dump_grids(path: str, width: int, height: int, **kwargs):
+    """Decode ``path`` sequentially with NVDEC and return per-display-frame
     dicts {cu_type, mv0_x, mv0_y, mv1_x, mv1_y}, each (mh, mw). Pixels are
     discarded -- only the decode-stats buffer is kept."""
-    return nvd.dump_nvdec_grids(hevc_path, width, height, gpu_id=_gpu_id())
+    return nvd.dump_nvdec_grids(path, width, height, gpu_id=_gpu_id(), **kwargs)
 
 
-def get_or_build_nvdec_stats(video_path: str, frame_indices):
-    """Windowed-encode then NVDEC-dump to a cached .npz of 16x16 grids.
+def _pack_nvdec_grids(grids, pocs):
+    pocs = sorted(set(int(p) for p in pocs))
+    missing = [p for p in pocs if p >= len(grids) or grids[p] is None]
+    if missing:
+        raise RuntimeError(f"NVDEC did not return statistics for target frames {missing}")
+    selected = [grids[p] for p in pocs]
+    packed = {
+        "stream_poc": np.asarray(pocs, dtype=np.int32),
+        "cu_type": np.stack([g["cu_type"] for g in selected]),
+        "mv0_x": np.stack([g["mv0_x"] for g in selected]),
+        "mv0_y": np.stack([g["mv0_y"] for g in selected]),
+        "mv1_x": np.stack([g["mv1_x"] for g in selected]),
+        "mv1_y": np.stack([g["mv1_y"] for g in selected]),
+    }
+    packed["poc_to_row"] = {poc: row for row, poc in enumerate(pocs)}
+    return packed
 
-    Returns (npz_path, width, height, poc_map). The npz stores raw cu_type/MVs
-    (not scored maps) so w_motion/skip_penalty stay runtime parameters, matching
-    how the CSV backend defers scoring until parse time.
+
+def _write_nvdec_npz(npz_path, width, height, poc_map, n_frames, packed):
+    tmp = f"{npz_path}.{os.getpid()}.{threading.get_ident()}.tmp.npz"
+    save = np.savez_compressed if os.environ.get("CODEC_COMPRESS_CACHE", "0") == "1" else np.savez
+    try:
+        save(
+            tmp,
+            format_version=np.int32(CACHE_FORMAT_VERSION),
+            width=np.int32(width),
+            height=np.int32(height),
+            n_frames=np.int32(n_frames),
+            poc_real=np.asarray(list(poc_map.keys()), dtype=np.int32),
+            poc_stream=np.asarray(list(poc_map.values()), dtype=np.int32),
+            stream_poc=packed["stream_poc"],
+            cu_type=packed["cu_type"],
+            mv0_x=packed["mv0_x"],
+            mv0_y=packed["mv0_y"],
+            mv1_x=packed["mv1_x"],
+            mv1_y=packed["mv1_y"],
+        )
+        os.replace(tmp, npz_path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _persist_nvdec_npz(npz_path, width, height, poc_map, n_frames, packed):
+    if os.environ.get("CODEC_PERSIST_CACHE", "1") != "0":
+        _CACHE_EXECUTOR.submit(
+            _write_nvdec_npz, npz_path, width, height, dict(poc_map), n_frames, packed
+        )
+
+
+def _existing_nvdec_cache(video_path, frame_indices, variant):
+    key = _video_key(video_path, frame_indices, variant=variant)
+    path = os.path.join(NVDEC_CACHE_DIR, f"{key}.npz")
+    cached = _NVDEC_MEMORY_CACHE.get(path)
+    if cached is not None:
+        _NVDEC_MEMORY_CACHE.move_to_end(path)
+        _packed, w, h, poc_map, _n = cached
+        return path, w, h, dict(poc_map)
+    if os.path.exists(path):
+        _load_nvdec_npz(path)
+        _packed, w, h, poc_map, _n = _NVDEC_MEMORY_CACHE[path]
+        return path, w, h, poc_map
+    return None
+
+
+def _finish_nvdec_stats(npz_path, width, height, poc_map, grids):
+    target_pocs = sorted(set(poc_map.values()))
+    packed = _pack_nvdec_grids(grids, target_pocs)
+    _remember(
+        _NVDEC_MEMORY_CACHE,
+        npz_path,
+        (packed, int(width), int(height), dict(poc_map), len(grids)),
+    )
+    _persist_nvdec_npz(npz_path, width, height, poc_map, len(grids), packed)
+    return npz_path, width, height, poc_map
+
+
+def get_or_build_nvdec_stats(video_path: str, frame_indices, source_width=None, source_height=None):
+    """Return selected NVDEC statistics, using source H.264/HEVC when possible.
+
+    ``CODEC_NVDEC_SOURCE_MODE=auto`` (default) avoids the CPU decode/x265
+    transcode for H.264/HEVC sources. ``off`` retains controlled windowed-x265
+    semantics; ``force`` rejects unsupported source codecs instead of falling
+    back. Only target frames' stats are copied to NumPy in either path.
     """
     os.makedirs(NVDEC_CACHE_DIR, exist_ok=True)
-    key = _video_key(video_path, frame_indices)
-    npz_path = os.path.join(NVDEC_CACHE_DIR, f"{key}.npz")
-    if os.path.exists(npz_path):
-        w, h, poc_map, _n = _nvdec_npz_meta(npz_path)
-        return npz_path, w, h, poc_map
+    source_mode = os.environ.get("CODEC_NVDEC_SOURCE_MODE", "auto").lower()
+    if source_mode not in {"auto", "off", "force"}:
+        raise ValueError("CODEC_NVDEC_SOURCE_MODE must be auto, off, or force")
 
+    target_indices = sorted(set(int(i) for i in frame_indices))
+    if not target_indices:
+        raise ValueError("frame_indices must not be empty")
+    if target_indices[0] < 0:
+        raise ValueError("frame_indices must be non-negative")
+
+    if source_mode != "off":
+        cached = _existing_nvdec_cache(video_path, frame_indices, "nvdec-source")
+        if cached is not None:
+            return cached
+
+    # A fallback cache can only have been produced after a previous direct
+    # source attempt found this codec unsupported (or source mode was off).
+    # Reuse it without reopening and reprobeing the input on every auto query.
+    if source_mode != "force":
+        fallback_cached = _existing_nvdec_cache(
+            video_path, frame_indices, "nvdec-x265-windowed"
+        )
+        if fallback_cached is not None:
+            return fallback_cached
+
+    if source_mode != "off":
+        if source_width is None or source_height is None:
+            source_width, source_height = _video_dimensions(video_path)
+        poc_map = {i: i for i in target_indices}
+        key = _video_key(video_path, frame_indices, variant="nvdec-source")
+        npz_path = os.path.join(NVDEC_CACHE_DIR, f"{key}.npz")
+        try:
+            grids = _nvdec_dump_grids(
+                video_path,
+                source_width,
+                source_height,
+                max_frames=target_indices[-1] + 1,
+                keep_frames=target_indices,
+                require_stats_codec=True,
+            )
+            return _finish_nvdec_stats(
+                npz_path, source_width, source_height, poc_map, grids
+            )
+        except nvd.UnsupportedDecodeStatsCodec:
+            if source_mode == "force":
+                raise
+
+    key = _video_key(video_path, frame_indices, variant="nvdec-x265-windowed")
+    npz_path = os.path.join(NVDEC_CACHE_DIR, f"{key}.npz")
     hevc_path = os.path.join(NVDEC_CACHE_DIR, f"{key}.hevc")
-    w, h, poc_map = _extract_and_encode_windows(video_path, frame_indices, hevc_path)
     try:
-        grids = _nvdec_dump_grids(hevc_path, w, h)
+        w, h, poc_map, n_stream_frames = _extract_and_encode_windows(
+            video_path, target_indices, hevc_path
+        )
+        target_pocs = sorted(set(poc_map.values()))
+        grids = _nvdec_dump_grids(
+            hevc_path,
+            w,
+            h,
+            max_frames=n_stream_frames,
+            keep_frames=target_pocs,
+            require_stats_codec=True,
+        )
+        if len(grids) != n_stream_frames:
+            raise RuntimeError(
+                f"NVDEC decoded {len(grids)} frames from windowed stream, "
+                f"expected {n_stream_frames}"
+            )
+        return _finish_nvdec_stats(npz_path, w, h, poc_map, grids)
     finally:
         if os.path.exists(hevc_path):
             os.remove(hevc_path)
 
-    n_expected = (max(poc_map.values()) + 1) if poc_map else 0
-    if len(grids) != n_expected:
-        raise RuntimeError(
-            f"NVDEC decoded {len(grids)} frames from windowed stream, expected {n_expected} "
-            f"(display-order POCs 0..{n_expected - 1})"
-        )
 
-    np.savez_compressed(
-        npz_path,
-        width=np.int32(w),
-        height=np.int32(h),
-        poc_real=np.array(list(poc_map.keys()), dtype=np.int32),
-        poc_stream=np.array(list(poc_map.values()), dtype=np.int32),
-        cu_type=np.stack([g["cu_type"] for g in grids]),
-        mv0_x=np.stack([g["mv0_x"] for g in grids]),
-        mv0_y=np.stack([g["mv0_y"] for g in grids]),
-        mv1_x=np.stack([g["mv1_x"] for g in grids]),
-        mv1_y=np.stack([g["mv1_y"] for g in grids]),
-    )
-    return npz_path, w, h, poc_map
-
-
-@functools.lru_cache(maxsize=8)
-def _nvdec_npz_meta(npz_path: str):
+def _load_nvdec_npz(npz_path: str):
+    """Load metadata and selected stacks in one pass, once per process."""
+    cached = _NVDEC_MEMORY_CACHE.get(npz_path)
+    if cached is not None:
+        _NVDEC_MEMORY_CACHE.move_to_end(npz_path)
+        return cached[0]
     with np.load(npz_path) as data:
         w, h = int(data["width"]), int(data["height"])
         poc_pairs = zip(data["poc_real"].tolist(), data["poc_stream"].tolist())
-        n = int(data["cu_type"].shape[0])
-    return w, h, dict(poc_pairs), n
-
-
-@functools.lru_cache(maxsize=8)
-def _load_nvdec_npz(npz_path: str):
-    """Keep the raw 16x16 stacks in process memory (same role as _cached_by_poc)."""
-    with np.load(npz_path) as data:
-        return {
+        poc_map = dict(poc_pairs)
+        n_frames = int(data["n_frames"])
+        packed = {
+            "stream_poc": np.asarray(data["stream_poc"]),
             "cu_type": np.asarray(data["cu_type"]),
             "mv0_x": np.asarray(data["mv0_x"]),
             "mv0_y": np.asarray(data["mv0_y"]),
             "mv1_x": np.asarray(data["mv1_x"]),
             "mv1_y": np.asarray(data["mv1_y"]),
         }
-
-
-@functools.lru_cache(maxsize=8)
-def _cached_by_poc(csv_path: str, pocs: tuple, w_motion: float, skip_penalty: float):
-    """Parse only the needed POCs' rows out of a hevc_dump CSV once per process,
-    and keep the (POC -> [(cu, score)]) grouping in memory.
-
-    A full-video CSV can be tens of millions of lines while a query only needs
-    ~16 sampled frames; grep-filtering to just those POCs before any Python
-    parsing (h2g.parse_csv_for_pocs) turns an ~O(24M-line) scan into an
-    ~O(16-frames-worth-of-lines) one. This in turn also means repeat queries
-    against the same video within a process hit this cache directly. Both were
-    needed to fix the ~78s/query codec-mode latency documented in
-    HEVC_Dump_Pipeline.md's performance-finding section -- the CSV *file* being
-    cached on disk was not, by itself, enough."""
-    cus = h2g.parse_csv_for_pocs(csv_path, pocs)
-    by_poc = {}
-    for cu in cus:
-        by_poc.setdefault(cu["poc"], []).append((cu, h2g.score_cu(cu, w_motion, skip_penalty)))
-    return by_poc
+    packed["poc_to_row"] = {
+        int(poc): row for row, poc in enumerate(packed["stream_poc"].tolist())
+    }
+    _remember(_NVDEC_MEMORY_CACHE, npz_path, (packed, w, h, poc_map, n_frames))
+    return packed
 
 
 @functools.lru_cache(maxsize=1024)
-def _cached_frame_score_map(csv_path: str, poc: int, pocs: tuple, w_motion: float, skip_penalty: float, orig_w: int, orig_h: int):
+def _cached_frame_score_map(stats_path: str, poc: int, w_motion: float, skip_penalty: float, orig_w: int, orig_h: int):
     """Full-resolution per-frame score map, built once per (video, POC) and reused
     across every spatial tile that needs a crop of it -- replaces re-looping over
     the frame's CU list (and repainting a canvas from scratch) once per tile."""
-    by_poc = _cached_by_poc(csv_path, pocs, w_motion, skip_penalty)
-    return h2g.build_frame_score_map(by_poc.get(poc, []), orig_w, orig_h)
+    _w, _h, by_poc = _load_lib_stats(stats_path)
+    blocks = by_poc.get(poc, np.empty(0, dtype=h2g.BLOCK_STATS_DTYPE))
+    scores = h2g.score_block_array(blocks, w_motion, skip_penalty)
+    return h2g.build_frame_score_map_from_blocks(blocks, scores, orig_w, orig_h)
 
 
 @functools.lru_cache(maxsize=1024)
@@ -291,20 +492,23 @@ def _cached_nvdec_cu_scores(npz_path: str, poc: int, w_motion: float, skip_penal
     """Per-frame 16x16 score grid (not upsampled). Token rasterization maps
     pixel crop boxes into this CU-cell space."""
     packed = _load_nvdec_npz(npz_path)
+    row = packed["poc_to_row"][poc]
     return h2g.score_cu_grid(
-        packed["cu_type"][poc],
-        packed["mv0_x"][poc], packed["mv0_y"][poc],
-        packed["mv1_x"][poc], packed["mv1_y"][poc],
+        packed["cu_type"][row],
+        packed["mv0_x"][row], packed["mv0_y"][row],
+        packed["mv1_x"][row], packed["mv1_y"][row],
         w_motion, skip_penalty,
     )
 
 
-def _sampled_frame_indices(video_path: str, num_frames: int):
+def _sampled_frame_info(video_path: str, num_frames: int):
     """Mirrors processing_nvila.py::_load_video_frames's frame-index selection
-    exactly (same cv2 frame-count probing + np.linspace), without decoding frames."""
+    exactly and returns ``(indices, width, height)``."""
     vidcap = cv2.VideoCapture(video_path)
     if not vidcap.isOpened():
         raise ValueError(f"Failed to open video: {video_path}")
+    width = int(vidcap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(vidcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
     while frame_count > 0:
         vidcap.set(cv2.CAP_PROP_POS_FRAMES, frame_count - 1)
@@ -314,7 +518,25 @@ def _sampled_frame_indices(video_path: str, num_frames: int):
     vidcap.release()
     if frame_count <= 0:
         raise ValueError(f"Video '{video_path}' has no frames.")
-    return np.round(np.linspace(0, frame_count - 1, num_frames)).astype(int).tolist()
+    indices = np.round(np.linspace(0, frame_count - 1, num_frames)).astype(int).tolist()
+    return indices, width, height
+
+
+def _sampled_frame_indices(video_path: str, num_frames: int):
+    return _sampled_frame_info(video_path, num_frames)[0]
+
+
+def _video_dimensions(video_path: str):
+    vidcap = cv2.VideoCapture(video_path)
+    if not vidcap.isOpened():
+        raise ValueError(f"Failed to open video: {video_path}")
+    try:
+        return (
+            int(vidcap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(vidcap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        )
+    finally:
+        vidcap.release()
 
 
 def _find_closest_aspect_ratio_fn():
@@ -353,14 +575,16 @@ def build_gazing_info(
     count per frame), this always selects a fixed top-k = round(total_patches *
     ratio) per frame, so if_padded is always False -- there's no padding to signal.
 
-    `backend`: "libde265" (true CU tree via dump_stats CSV) or "nvdec"
-    (PyNvVideoCodec 16x16 decode-stats, no CSV).
+    ``backend`` is ``libde265`` (true CU tree via compact dump_stats output) or
+    ``nvdec`` (PyNvVideoCodec 16x16 decode stats).
     """
     find_closest_aspect_ratio = _find_closest_aspect_ratio_fn()
 
-    frame_indices = _sampled_frame_indices(video_path, num_video_frames)
+    frame_indices, source_w, source_h = _sampled_frame_info(video_path, num_video_frames)
     if backend == "nvdec":
-        npz_path, orig_w, orig_h, poc_map = get_or_build_nvdec_stats(video_path, frame_indices)
+        npz_path, orig_w, orig_h, poc_map = get_or_build_nvdec_stats(
+            video_path, frame_indices, source_width=source_w, source_height=source_h
+        )
 
         def score_region(poc, box_x0, box_y0, box_w, box_h):
             grid = _cached_nvdec_cu_scores(npz_path, poc, w_motion, skip_penalty)
@@ -368,12 +592,11 @@ def build_gazing_info(
                 grid, box_x0, box_y0, box_w, box_h, scales, patch_size
             )
     elif backend == "libde265":
-        csv_path, orig_w, orig_h, poc_map = get_or_build_stats(video_path, frame_indices)
-        pocs = tuple(sorted(set(poc_map.values())))
+        stats_path, orig_w, orig_h, poc_map = get_or_build_stats(video_path, frame_indices)
 
         def score_region(poc, box_x0, box_y0, box_w, box_h):
             score_map = _cached_frame_score_map(
-                csv_path, poc, pocs, w_motion, skip_penalty, orig_w, orig_h
+                stats_path, poc, w_motion, skip_penalty, orig_w, orig_h
             )
             return h2g.rasterize_multiscale_from_map(
                 score_map, box_x0, box_y0, box_w, box_h, scales, patch_size
@@ -431,7 +654,7 @@ def build_gazing_info(
                 poc = poc_map[frame_indices[t_chunk * T_tile + f_local]]
                 scores = score_region(poc, box_x0, box_y0, box_w, box_h)
                 k = topk_ratio(gazing_ratio_tile, f_local)
-                ranked = np.sort(np.argsort(-scores)[:k])  # ascending, matching _sort_gazing_pos_per_frame
+                ranked = h2g.topk_sorted_indices(scores, k)
                 frame_pos.append(torch.as_tensor(ranked, dtype=torch.long))
                 frame_counts.append(k)
             tile_pos.append(torch.cat(frame_pos))
@@ -453,7 +676,7 @@ def build_gazing_info(
         poc = poc_map[real_idx]
         scores = score_region(poc, 0, 0, orig_w, orig_h)
         k = topk_ratio(gazing_ratio_thumbnail if gazing_ratio_thumbnail is not None else 1.0, 0)
-        ranked = np.sort(np.argsort(-scores)[:k])
+        ranked = h2g.topk_sorted_indices(scores, k)
         thumb_pos.append(torch.as_tensor(ranked, dtype=torch.long))
         thumb_counts.append(k)
 
