@@ -70,15 +70,47 @@ Details: [`scripts/hevc_dump/README.md`](scripts/hevc_dump/README.md).
 
 ## 4. Data
 
+**Videos:**
+
 ```bash
 mkdir -p data/egoschema
 huggingface-cli download VLM2Vec/egoschema-rawvideo --repo-type dataset \
   --local-dir data/egoschema/videos
 ```
 
-Then place `data/egoschema/subset.json` (`{q_uid, question, "option 0".."option 4",
-answer, ...}` per question) — source from the official EgoSchema repo
-(github.com/egoschema/EgoSchema); it isn't part of the video download above.
+**Questions + answers**, from the official EgoSchema repo:
+
+```bash
+git clone https://github.com/egoschema/EgoSchema.git /tmp/EgoSchema_official
+cp /tmp/EgoSchema_official/questions.json data/egoschema/questions.json
+cp /tmp/EgoSchema_official/subset_answers.json data/egoschema/subset_answers.json
+```
+
+`questions.json` is the full 5,031-question set (no answers, held out for leaderboard
+submission); `subset_answers.json` is `{q_uid: answer_idx}` for just the 500-question
+public Subset this repo uses. `data/egoschema/subset.json` (what `dataset.py` actually
+reads) is the two merged — filtered to the 500 Subset `q_uid`s, with `answer` added:
+
+```bash
+python3 -c "
+import json
+
+questions = json.load(open('data/egoschema/questions.json'))
+answers = json.load(open('data/egoschema/subset_answers.json'))
+
+by_quid = {q['q_uid']: q for q in questions}
+subset = []
+for q_uid, answer in answers.items():
+    item = dict(by_quid[q_uid])
+    item['answer'] = answer
+    subset.append(item)
+
+json.dump(subset, open('data/egoschema/subset.json', 'w'))
+print(f'wrote {len(subset)} questions to data/egoschema/subset.json')
+"
+```
+
+Should print `wrote 500 questions to data/egoschema/subset.json`.
 
 No model download step needed — `nvidia/NVILA-8B-HD-Video` and `nvidia/AutoGaze`
 auto-download from Hugging Face Hub on first run (`trust_remote_code=True`, neither gated
