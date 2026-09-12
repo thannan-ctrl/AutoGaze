@@ -10,6 +10,10 @@
 
 `codec_nvdec` needs a GB200-class node, driver ≥595.84.01. `dense`/`codec` run anywhere.
 
+**Paths** (all relative to the repo root, i.e. `REPO_DIR`):
+- Data: `data/egoschema/` — `videos/*.mp4`, `subset.json`, `questions.json`, `subset_answers.json`
+- Results: `benchmark_results/` — `nvila_hd_accuracy_breakdown_{mode}_egoschema_nvf16.jsonl` (per-question), `..._summary_egoschema_nvf16.json` (averaged)
+
 ## 0. Get a node
 
 ```bash
