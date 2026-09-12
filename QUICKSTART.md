@@ -137,29 +137,50 @@ Each mode writes two files under `benchmark_results/`:
 overwritten per mode, so copy it aside between runs if running modes separately, or use the
 combined `MODES=dense,codec,codec_nvdec` run from step 5, which appends per mode instead).
 
-Read the per-question JSONL directly and average the fields that make up the table's
-columns (Encode/Decode = `codec_encode_ms`/`codec_decode_ms`, Selector =
-`selector_score_ms` + `selector_rank_ms`, ViT = `vit_ms`, LLM = `llm_ms`):
+Read the per-question JSONL directly and average **every** timing/count field the harness
+records per question (`runner.py`'s full return dict — not just the headline columns from
+the table at the top):
 
 ```bash
 python3 -c "
-import json, glob
+import json
 
-for mode in ['dense', 'codec', 'codec_nvdec']:
+FIELDS = [
+    'num_tokens',
+    'preproc_ms', 'decode_ms', 'image_preproc_ms', 'autogaze_ops_ms', 'autogaze_model_ms',
+    'codec_encode_ms', 'codec_decode_ms',
+    'selector_score_ms', 'selector_rank_ms',
+    'selector_csvparse_ms', 'selector_scorecu_ms', 'selector_paintmap_ms',
+    'gazing_info_total_ms', 'selector_glue_ms',
+    'other_ms', 'cpu_ms', 'gpu_ms',
+    'generate_ms', 'vit_ms', 'llm_prefill_ms', 'llm_decode_ms', 'llm_ms', 'llm_calls',
+    'e2e_ms',
+]
+
+modes = ['dense', 'codec', 'codec_nvdec']
+rows_by_mode = {}
+for mode in modes:
     path = f'benchmark_results/nvila_hd_accuracy_breakdown_{mode}_egoschema_nvf16.jsonl'
-    rows = [json.loads(l) for l in open(path)]
+    rows_by_mode[mode] = [json.loads(l) for l in open(path)]
+
+header = ['mode', 'n', 'acc'] + FIELDS
+print(' | '.join(header))
+print(' | '.join('---' for _ in header))
+for mode in modes:
+    rows = rows_by_mode[mode]
     n = len(rows)
     acc = sum(r.get('correct', False) for r in rows) / n
-    avg = lambda k: sum(r.get(k, 0) or 0 for r in rows) / n
-    print(f'{mode:12s} n={n:4d} acc={acc:.1%} '
-          f'tokens={avg(\"num_tokens\"):6.0f} '
-          f'encode={avg(\"codec_encode_ms\")/1000:5.2f}s '
-          f'decode={avg(\"codec_decode_ms\")/1000:5.2f}s '
-          f'selector={(avg(\"selector_score_ms\")+avg(\"selector_rank_ms\"))/1000:5.2f}s '
-          f'vit={avg(\"vit_ms\")/1000:5.2f}s '
-          f'llm={avg(\"llm_ms\")/1000:5.2f}s '
-          f'e2e={avg(\"e2e_ms\")/1000:5.2f}s')
+    avg = lambda k: sum((r.get(k) or 0) for r in rows) / n
+    cells = [mode, str(n), f'{acc:.1%}']
+    for f in FIELDS:
+        v = avg(f)
+        cells.append(f'{v:.0f}' if f in ('num_tokens', 'llm_calls') else f'{v/1000:.3f}s')
+    print(' | '.join(cells))
 "
 ```
 
-That prints one line per mode with the same numbers as the table at the top of this file.
+Every field is 0 where a mode genuinely doesn't touch that code path — e.g. `dense` has no
+`codec_*`/`selector_*` fields (no patch selection at all), and `codec_nvdec` has no
+`selector_csvparse_ms`/`selector_scorecu_ms`/`selector_paintmap_ms` (those are `libde265`
+CSV-parsing-only; the NVDEC backend gets its data from `.npz` decode stats instead, never
+touching that code path) — that's expected, not a bug.
