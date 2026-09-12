@@ -8,8 +8,63 @@ safe.
 import importlib
 
 import torch
+from transformers import LogitsProcessor
 
 from . import config, timing
+
+# Which scale (from the processor's own target_scales ladder) "autogaze_singlescale"
+# restricts generation to -- see SingleScaleLogitsProcessor below for why this is a
+# generation-time mask rather than a target_scales=[N] reconfiguration. 224 chosen as
+# a literature-standard "default resolution" (ImageNet-style 224x224), not because
+# anything else about it is special -- any of the model's other scales would work
+# equally well as the ablation's single-scale choice.
+SINGLE_SCALE_TARGET = 224
+
+
+def _scale_token_range(scales, patch_size, target_scale):
+    """[lo, hi) vocab-index range for one scale within AutoGaze's flat
+    multi-scale vocabulary (scales concatenated in ladder order, patch-grid-major
+    -- same convention as codec_selector.py's total_patches/grid_sizes)."""
+    grid_sizes = [s // patch_size for s in scales]
+    offset = 0
+    for s, g in zip(scales, grid_sizes):
+        if s == target_scale:
+            return offset, offset + g * g
+        offset += g * g
+    raise ValueError(f"scale {target_scale} not in {scales}")
+
+
+class SingleScaleLogitsProcessor(LogitsProcessor):
+    """Restricts AutoGaze's autoregressive generation to one scale's token range
+    within its flat multi-scale vocabulary -- Next Steps' "test AutoGaze with a
+    single resolution scale" ablation.
+
+    Why a generation-time mask instead of reconfiguring target_scales=[N]: AutoGaze
+    is a *trained* model whose classification head has a fixed output dimension
+    matching the full 4-scale vocab (56/112/224/448 at patch_size=16 by default)
+    it was trained on. Passing a single-scale target_scales into the processor
+    would change vocab_size and break at the model's output layer (or silently
+    misalign token meanings even if shapes coincidentally matched) -- there's no
+    way to get a faithful single-scale *trained* baseline without retraining.
+    Masking at generation time keeps the model and its trained weights completely
+    unchanged; it only removes 3 of the 4 scales' tokens as *choices* the existing
+    autoregressive policy is allowed to make, at every generation step, alongside
+    the pre-existing NoRepeatTokensLogitsProcessor/NoEosTokenLogitsProcessor this
+    list already carries (see autogaze/models/autogaze/modeling_autogaze.py)."""
+
+    def __init__(self, lo: int, hi: int):
+        super().__init__()
+        self.lo = lo
+        self.hi = hi
+
+    def __call__(self, input_ids, scores):
+        mask = torch.ones(scores.shape[-1], dtype=torch.bool, device=scores.device)
+        mask[self.lo:self.hi] = False
+        if scores.ndim == 3:
+            scores[:, :, mask] = -float("inf")
+        else:
+            scores[:, mask] = -float("inf")
+        return scores
 
 _processor_module_patched = False
 _skip_autogaze_transform_state = {"skip": False}
@@ -150,6 +205,9 @@ def instrument(processor, mode: str | None = None) -> None:
 
     if processor._autogaze_model is not None:
         timing.wrap_cuda_forward(processor._autogaze_model, "autogaze_model_ms")
+        if mode == "autogaze_singlescale":
+            lo, hi = _scale_token_range(processor.target_scales, processor.target_patch_size, SINGLE_SCALE_TARGET)
+            processor._autogaze_model.gazing_model.logits_processor.append(SingleScaleLogitsProcessor(lo, hi))
 
     skip_tiles = cls._should_gaze_all_patches(processor.gazing_ratio_tile, processor.task_loss_requirement_tile)
     skip_thumbs = cls._should_gaze_all_patches(

@@ -211,6 +211,38 @@ quota, concurrent-writer resume bugs) hit while gathering this data.
 **Full results, methodology, comparison videos, and reproduction commands:**
 [`Codec_Selector_Feasibility.md`](Codec_Selector_Feasibility.md).
 
+## Running `codec_nvdec` (optimized selector) — quickstart
+
+The fastest mode measured so far: 60.6% accuracy / **2.44s** avg end-to-end on EgoSchema
+(vs. 6.24s for AutoGaze's own trained selector) — see
+[`Codec_Selector_Feasibility.md`](Codec_Selector_Feasibility.md) for the full table. This
+section is the minimal path to reproduce that specific number.
+
+**Prerequisites** (on top of the pip deps in "Installation" above):
+- GB200-class hardware with NVIDIA driver ≥595.84.01 / Video Codec SDK 13.1+. Only confirmed
+  working on `gb200nvl4`-class nodes this session — an older-driver node (e.g.
+  `gb200nvl72_preprod`) does not support NVDEC and `codec_nvdec` will fail there.
+- `PyNvVideoCodec` (`pip install PyNvVideoCodec`, same environment as the rest of the repo).
+- `scripts/nvdec_dump.py` (included in this branch) — the PyNvVideoCodec wrapper
+  `codec_nvdec` requires. Without it, `codec_nvdec` raises
+  `"backend='nvdec' requires scripts/nvdec_dump.py"` immediately.
+
+Unlike `codec`/`codec_geo`/`codec_ord` (the CPU/`libde265` backends), `codec_nvdec` does
+**not** need the `scripts/hevc_dump` submodule built — that's only on the CPU decode path.
+If you want those other modes too, see `Codec_Selector_Feasibility.md`'s Implementation
+section for the extra CMake build step.
+
+**Run it:**
+
+```bash
+FIXED_NUM_VIDEO_FRAMES=16 N_SAMPLES=full MAX_BATCH_SIZE_AUTOGAZE=32 \
+  MODES=codec_nvdec DATASET=egoschema \
+  python3 scripts/nvila_hd_accuracy_breakdown_test.py
+```
+
+Expected result (full N=500 EgoSchema Subset): **60.6% accuracy, ~2.44s avg end-to-end** —
+if your numbers are in that ballpark, setup worked.
+
 ## Idea: Student Distillation for Faster AutoGaze
 
 The latency breakdown above shows AutoGaze's gazing model is the dominant cost, driven by its

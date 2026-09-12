@@ -8,7 +8,9 @@ import torch
 
 TIMING_KEYS = [
     "decode_ms", "preprocess_videos_total_ms", "autogaze_transform_ms",
-    "gazing_info_total_ms", "autogaze_model_ms",
+    "gazing_info_total_ms", "autogaze_model_ms", "codec_encode_ms", "codec_decode_ms",
+    "selector_score_ms", "selector_rank_ms",
+    "selector_csvparse_ms", "selector_scorecu_ms", "selector_paintmap_ms",
     "vit_ms", "llm_prefill_ms", "llm_decode_ms", "llm_calls",
 ]
 
@@ -22,6 +24,13 @@ def reset() -> None:
 
 def snapshot() -> dict:
     return dict(_timing)
+
+
+def add(key: str, ms: float) -> None:
+    """Accumulate into a timing key from outside this module (e.g.
+    codec_selector.py timing its own encode step, which isn't a plain
+    wrap_cpu_time-able function since it only runs on a cache miss)."""
+    _timing[key] += ms
 
 
 def wrap_cpu_time(fn, key: str):

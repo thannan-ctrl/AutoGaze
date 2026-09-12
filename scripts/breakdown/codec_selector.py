@@ -37,10 +37,13 @@ import hashlib
 import os
 import platform
 import sys
+import time
 
 import cv2
 import numpy as np
 import torch
+
+from . import timing
 
 WINDOW = 4  # real frames of context before each scored frame (5 frames/window total)
 
@@ -64,10 +67,20 @@ _BUILD_DIR = "cmake_build_aarch64" if platform.machine() == "aarch64" else "cmak
 DUMP_STATS_BIN = os.path.join(_REPO_DIR, "scripts", "hevc_dump", _BUILD_DIR, "dump_stats")
 CACHE_DIR = os.path.join(_REPO_DIR, "data", "hevc_dump_cache")
 NVDEC_CACHE_DIR = os.path.join(_REPO_DIR, "data", "hevc_nvdec_cache")
+# Separate from CACHE_DIR: hevc_geo/hevc_ord encode at AutoGaze's own resized
+# resolution (see _build_gazing_info_hevc_autogaze), not the source video's
+# native resolution -- a different encode of the same video, so it needs its
+# own cache namespace rather than sharing keys with the native-res "codec"/
+# "codec_nvdec" cache.
+HEVC_AUTOGAZE_CACHE_DIR = os.path.join(_REPO_DIR, "data", "hevc_autogaze_cache")
 
 # Benchmark mode name -> dump backend. "codec" keeps the original libde265/CSV
-# path; "codec_nvdec" is the NVDEC 16x16 variant.
-BACKEND_FOR_MODE = {"codec": "libde265", "codec_nvdec": "nvdec"}
+# path; "codec_nvdec" is the NVDEC 16x16 variant; "codec_geo"/"codec_ord" score
+# via hevc_autogaze.py's CU-size-vs-AutoGaze-scale kernel (geometric/ordinal).
+BACKEND_FOR_MODE = {
+    "codec": "libde265", "codec_nvdec": "nvdec",
+    "codec_geo": "hevc_geo", "codec_ord": "hevc_ord",
+}
 
 
 def _video_key(video_path: str, frame_indices, sampled_only: bool = False, gop_restart: int | None = None) -> str:
@@ -149,6 +162,272 @@ def _extract_and_encode_windows(video_path: str, frame_indices, hevc_path: str, 
         out.mux(packet)
     out.close()
     return w, h, poc_map
+
+
+def _probe_video_dims(video_path: str) -> tuple:
+    """Cheap (width, height) probe -- reads stream metadata only, no frame
+    decode. Used by the hevc_geo/hevc_ord backends to compute AutoGaze's tile
+    grid *before* encoding, so the encode itself can happen at that resized
+    resolution (see _build_gazing_info_hevc_autogaze)."""
+    import av
+
+    src = av.open(video_path)
+    vs = src.streams.video[0]
+    w, h = vs.codec_context.width, vs.codec_context.height
+    src.close()
+    return w, h
+
+
+def _extract_and_encode_windows_resized(
+    video_path: str, frame_indices, hevc_path: str, target_w: int, target_h: int, container: str = "hevc"
+):
+    """Like `_extract_and_encode_windows`, but each real frame is resized to
+    (target_w, target_h) *before* encoding, so the encoded stream's native HEVC
+    CU sizes are directly comparable, pixel-for-pixel, to AutoGaze's patch
+    coverage -- hevc_autogaze.py's kernel table assumes exactly this (see
+    Codec_Selector_Feasibility.md's "hevc_autogaze integration" section). The
+    plain (native-resolution) encode used by "codec"/"codec_nvdec" doesn't
+    satisfy that assumption whenever AutoGaze's own resize factor isn't 1:1.
+
+    Returns (target_w, target_h, poc_map) -- same shape as
+    `_extract_and_encode_windows`, so callers can treat target_w/target_h as
+    this stream's "orig_w/orig_h" downstream.
+    """
+    import av
+    from av.video.frame import PictureType
+
+    windows = [list(range(max(0, idx - WINDOW), idx + 1)) for idx in frame_indices]
+    needed = sorted({i for win in windows for i in win})
+
+    src = av.open(video_path)
+    vs = src.streams.video[0]
+    needed_set = set(needed)
+    max_needed = max(needed)
+    frames_by_idx = {}
+    frame_i = 0
+    for frame in src.decode(vs):
+        if frame_i in needed_set:
+            arr = frame.to_ndarray(format="rgb24")
+            if arr.shape[1] != target_w or arr.shape[0] != target_h:
+                arr = cv2.resize(arr, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            frames_by_idx[frame_i] = arr
+        if frame_i >= max_needed:
+            break
+        frame_i += 1
+    src.close()
+
+    out = av.open(hevc_path, mode="w", format=container)
+    enc = out.add_stream("libx265", rate=25)
+    enc.width, enc.height = target_w, target_h
+    enc.pix_fmt = "yuv420p"
+    enc.options = {"x265-params": "qp=27:pools=8:scenecut=0", "preset": "superfast"}
+    poc_map = {}
+    new_poc = 0
+    for win in windows:
+        for j, i in enumerate(win):
+            vf = av.VideoFrame.from_ndarray(frames_by_idx[i], format="rgb24")
+            if j == 0:
+                vf.pict_type = PictureType.I
+            for packet in enc.encode(vf):
+                out.mux(packet)
+            poc_map[i] = new_poc
+            new_poc += 1
+    for packet in enc.encode():
+        out.mux(packet)
+    out.close()
+    return target_w, target_h, poc_map
+
+
+def get_or_build_hevc_autogaze_csv(video_path: str, frame_indices, target_w: int, target_h: int, tag: str):
+    """Encode `frame_indices`' windows resized to (target_w, target_h) and dump
+    libde265 decode-stats to CSV, cached under HEVC_AUTOGAZE_CACHE_DIR (separate
+    from CACHE_DIR -- a different resize target is a different encode of the
+    same video, so it needs its own cache key space). `tag` distinguishes the
+    tile-grid-resolution stream from the single-canvas thumbnail stream for the
+    same video -- both cover the same frame_indices in general but at different
+    resolutions, so they can't share a cache key even with target_w/target_h
+    already folded in (keeps the two easy to tell apart when debugging)."""
+    os.makedirs(HEVC_AUTOGAZE_CACHE_DIR, exist_ok=True)
+    st = os.stat(video_path)
+    frames_key = hashlib.sha1(str(sorted(set(frame_indices))).encode()).hexdigest()[:8]
+    key = (
+        hashlib.sha1(f"{video_path}:{st.st_size}:{st.st_mtime_ns}".encode()).hexdigest()[:16]
+        + f"_{frames_key}_{target_w}x{target_h}_{tag}"
+    )
+    csv_path = os.path.join(HEVC_AUTOGAZE_CACHE_DIR, f"{key}.csv")
+    pocmap_path = os.path.join(HEVC_AUTOGAZE_CACHE_DIR, f"{key}.pocmap")
+    if os.path.exists(csv_path) and os.path.exists(pocmap_path):
+        with open(pocmap_path) as f:
+            poc_map = dict(tuple(int(x) for x in line.split(",")) for line in f if line.strip())
+        return csv_path, poc_map
+
+    hevc_path = os.path.join(HEVC_AUTOGAZE_CACHE_DIR, f"{key}.hevc")
+    t_encode0 = time.time()
+    _, _, poc_map = _extract_and_encode_windows_resized(video_path, frame_indices, hevc_path, target_w, target_h)
+    # Only runs on a cache miss -- see get_or_build_stats's identical comment.
+    timing.add("codec_encode_ms", (time.time() - t_encode0) * 1000)
+
+    yuv_path = os.path.join(HEVC_AUTOGAZE_CACHE_DIR, f"{key}.yuv")
+    t_decode0 = time.time()
+    ret = os.system(f'"{DUMP_STATS_BIN}" "{hevc_path}" "{yuv_path}" "{csv_path}"')
+    timing.add("codec_decode_ms", (time.time() - t_decode0) * 1000)
+    if ret != 0:
+        raise RuntimeError(f"dump_stats failed on {video_path} ({tag}, exit code {ret})")
+    if os.path.exists(yuv_path):
+        os.remove(yuv_path)
+    with open(pocmap_path, "w") as f:
+        for real_idx, stream_poc in poc_map.items():
+            f.write(f"{real_idx},{stream_poc}\n")
+    return csv_path, poc_map
+
+
+@functools.lru_cache(maxsize=8)
+def _hevc_autogaze_scorer(image_size: int, patch_size: int, scales: tuple):
+    from scripts.hevc_dump.hevc_autogaze import HevcAutogazePatchScorer
+
+    return HevcAutogazePatchScorer(scales=list(scales), tile_size=image_size, patch_size=patch_size)
+
+
+@functools.lru_cache(maxsize=16)
+def _hevc_autogaze_result(csv_path: str, image_size: int, patch_size: int, scales: tuple):
+    scorer = _hevc_autogaze_scorer(image_size, patch_size, scales)
+    return scorer.score_csv(csv_path)
+
+
+def _build_gazing_info_hevc_autogaze(
+    video_path: str,
+    num_video_frames: int,
+    num_video_frames_thumbnail: int,
+    max_tiles_video: int,
+    autogaze_max_num_frames: int,
+    image_size: int,
+    scales: list,
+    patch_size: int,
+    gazing_ratio_tile,
+    gazing_ratio_thumbnail,
+    full_first_frame: bool,
+    kind: str,
+):
+    """backend in ("hevc_geo", "hevc_ord"): score via hevc_autogaze.py's
+    CU-size-vs-AutoGaze-scale kernel, which assumes the encoded stream *is*
+    the same pixel grid AutoGaze tiles (see Codec_Selector_Feasibility.md).
+    To make that true, this encodes TWO separate resized streams per video --
+    one at the real tile-grid resolution (cols*image_size x rows*image_size)
+    for spatial tiles, one at a single image_size x image_size canvas (whole
+    frame, 1x1 grid) for thumbnails -- rather than reusing the native-
+    resolution encode/cache shared by "codec"/"codec_nvdec". Roughly 2x the
+    Encode cost of "codec" as a result (two encode passes instead of one).
+
+    Once encoded this way, hevc_autogaze.py's own tile_grid() exactly matches
+    NVILA's cols x rows spatial tiling (target_w/target_h are exact multiples
+    of image_size), and its per-tile vocab layout (four scales, row-major)
+    exactly matches this codebase's total_patches ordering -- so scores are
+    read directly off HevcAutogazePatchScorer's own PatchScoreResult, no
+    crop/rasterize step needed (contrast with the libde265/nvdec backends'
+    score_region, which cross native pixel space via crop_and_resize_map).
+    """
+    find_closest_aspect_ratio = _find_closest_aspect_ratio_fn()
+    frame_indices = _sampled_frame_indices(video_path, num_video_frames)
+
+    orig_w, orig_h = _probe_video_dims(video_path)
+    aspect_ratio = orig_w / orig_h
+    max_spatial_tiles = max(max_tiles_video, 1)
+    target_ratios = sorted(
+        {
+            (i, j)
+            for n in range(1, max_spatial_tiles + 1)
+            for i in range(1, n + 1)
+            for j in range(1, n + 1)
+            if 1 <= i * j <= max_spatial_tiles
+        },
+        key=lambda x: x[0] * x[1],
+    )
+    cols, rows = find_closest_aspect_ratio(aspect_ratio, target_ratios, orig_w, orig_h, image_size)
+    target_w, target_h = image_size * cols, image_size * rows
+    num_spatial_tiles = cols * rows
+
+    temporal_chunks = num_video_frames // autogaze_max_num_frames
+    assert temporal_chunks >= 1 and num_video_frames % autogaze_max_num_frames == 0, (
+        f"num_video_frames ({num_video_frames}) must be divisible by "
+        f"autogaze_max_num_frames ({autogaze_max_num_frames})"
+    )
+    T_tile = autogaze_max_num_frames
+    grid_sizes = [s // patch_size for s in scales]
+    total_patches = sum(g * g for g in grid_sizes)
+    kind_name = "geometric" if kind == "hevc_geo" else "ordinal"
+
+    def topk_ratio(ratio, index):
+        r = ratio[index] if isinstance(ratio, (list, tuple)) else ratio
+        return max(1, int(round(total_patches * r)))
+
+    def frame_scores(result, poc):
+        return result.frame(poc) if kind_name == "geometric" else result.ordinal_frame(poc)
+
+    # --- tiles: encode resized to the real tile-grid resolution ---
+    tile_csv, tile_poc_map = get_or_build_hevc_autogaze_csv(video_path, frame_indices, target_w, target_h, tag="tiles")
+    tile_result = _hevc_autogaze_result(tile_csv, image_size, patch_size, tuple(scales))
+
+    tile_pos, tile_counts = [], []
+    for t_chunk in range(temporal_chunks):
+        for spatial_idx in range(num_spatial_tiles):
+            frame_pos, frame_counts = [], []
+            for f_local in range(T_tile):
+                real_idx = frame_indices[t_chunk * T_tile + f_local]
+                poc = tile_poc_map[real_idx]
+                t0 = time.time()
+                scores = frame_scores(tile_result, poc)[spatial_idx]
+                timing.add("selector_score_ms", (time.time() - t0) * 1000)
+                k = total_patches if (full_first_frame and f_local == 0) else topk_ratio(gazing_ratio_tile, f_local)
+                t0 = time.time()
+                ranked = np.sort(np.argsort(-scores)[:k])
+                timing.add("selector_rank_ms", (time.time() - t0) * 1000)
+                frame_pos.append(torch.as_tensor(ranked, dtype=torch.long))
+                frame_counts.append(k)
+            tile_pos.append(torch.cat(frame_pos))
+            tile_counts.append(torch.tensor(frame_counts, dtype=torch.long))
+
+    gazing_pos_tiles = torch.nn.utils.rnn.pad_sequence(tile_pos, batch_first=True, padding_value=0)
+    if_padded_gazing_tiles = torch.zeros_like(gazing_pos_tiles, dtype=torch.bool)
+    num_gazing_each_frame_tiles = torch.stack(tile_counts)
+
+    # --- thumbnails: encode resized to a single image_size x image_size canvas ---
+    if len(frame_indices) > num_video_frames_thumbnail:
+        step = len(frame_indices) // num_video_frames_thumbnail
+        thumb_indices = frame_indices[::step][:num_video_frames_thumbnail]
+    else:
+        thumb_indices = frame_indices
+
+    thumb_csv, thumb_poc_map = get_or_build_hevc_autogaze_csv(video_path, thumb_indices, image_size, image_size, tag="thumb")
+    thumb_result = _hevc_autogaze_result(thumb_csv, image_size, patch_size, tuple(scales))
+
+    thumb_pos, thumb_counts = [], []
+    for thumb_i, real_idx in enumerate(thumb_indices):
+        poc = thumb_poc_map[real_idx]
+        t0 = time.time()
+        scores = frame_scores(thumb_result, poc)[0]  # single 1x1-grid tile
+        timing.add("selector_score_ms", (time.time() - t0) * 1000)
+        if full_first_frame and thumb_i == 0:
+            k = total_patches
+        else:
+            k = topk_ratio(gazing_ratio_thumbnail if gazing_ratio_thumbnail is not None else 1.0, 0)
+        t0 = time.time()
+        ranked = np.sort(np.argsort(-scores)[:k])
+        timing.add("selector_rank_ms", (time.time() - t0) * 1000)
+        thumb_pos.append(torch.as_tensor(ranked, dtype=torch.long))
+        thumb_counts.append(k)
+
+    gazing_pos_thumbnails = torch.nn.utils.rnn.pad_sequence(thumb_pos, batch_first=True, padding_value=0)
+    if_padded_gazing_thumbnails = torch.zeros_like(gazing_pos_thumbnails, dtype=torch.bool)
+    num_gazing_each_frame_thumbnails = torch.tensor(thumb_counts, dtype=torch.long).unsqueeze(1)
+
+    return {
+        "gazing_pos_tiles": [gazing_pos_tiles],
+        "num_gazing_each_frame_tiles": [num_gazing_each_frame_tiles],
+        "if_padded_gazing_tiles": [if_padded_gazing_tiles],
+        "gazing_pos_thumbnails": [gazing_pos_thumbnails],
+        "num_gazing_each_frame_thumbnails": [num_gazing_each_frame_thumbnails],
+        "if_padded_gazing_thumbnails": [if_padded_gazing_thumbnails],
+    }
 
 
 def _encode_sampled_frames_only(video_path: str, frame_indices, hevc_path: str):
@@ -289,14 +568,21 @@ def get_or_build_stats(video_path: str, frame_indices, sampled_only: bool = Fals
         return csv_path, w, h, poc_map
 
     hevc_path = os.path.join(CACHE_DIR, f"{key}.hevc")
+    t_encode0 = time.time()
     if gop_restart:
         w, h, poc_map = _encode_periodic_restart(video_path, frame_indices, hevc_path, gop_restart)
     else:
         encode_fn = _encode_sampled_frames_only if sampled_only else _extract_and_encode_windows
         w, h, poc_map = encode_fn(video_path, frame_indices, hevc_path)
+    # Only runs on a cache miss -- a hit falls through the early `return`
+    # above, leaving this key at whatever timing.reset() left it (0 for the
+    # current question), which correctly reads as "no fresh encode happened".
+    timing.add("codec_encode_ms", (time.time() - t_encode0) * 1000)
 
     yuv_path = os.path.join(CACHE_DIR, f"{key}.yuv")
+    t_decode0 = time.time()
     ret = os.system(f'"{DUMP_STATS_BIN}" "{hevc_path}" "{yuv_path}" "{csv_path}"')
+    timing.add("codec_decode_ms", (time.time() - t_decode0) * 1000)
     if ret != 0:
         raise RuntimeError(f"dump_stats failed on {video_path} (exit code {ret})")
     if os.path.exists(yuv_path):
@@ -349,10 +635,14 @@ def get_or_build_nvdec_stats(video_path: str, frame_indices):
         return npz_path, w, h, poc_map
 
     hevc_path = os.path.join(NVDEC_CACHE_DIR, f"{key}.hevc")
+    t_encode0 = time.time()
     w, h, poc_map = _extract_and_encode_windows(video_path, frame_indices, hevc_path)
+    timing.add("codec_encode_ms", (time.time() - t_encode0) * 1000)
+    t_decode0 = time.time()
     try:
         grids = _nvdec_dump_grids(hevc_path, w, h)
     finally:
+        timing.add("codec_decode_ms", (time.time() - t_decode0) * 1000)
         if os.path.exists(hevc_path):
             os.remove(hevc_path)
 
@@ -413,10 +703,17 @@ def _cached_by_poc(csv_path: str, pocs: tuple, w_motion: float, skip_penalty: fl
     needed to fix the ~78s/query codec-mode latency documented in
     HEVC_Dump_Pipeline.md's performance-finding section -- the CSV *file* being
     cached on disk was not, by itself, enough."""
+    t0 = time.time()
     cus = h2g.parse_csv_for_pocs(csv_path, pocs)
+    _dt = (time.time() - t0) * 1000
+    if os.environ.get("DEBUG_CSVPARSE_CALLS"):
+        print(f"[DEBUG_CSVPARSE] call n_pocs={len(pocs)} dt_ms={_dt:.1f} csv_path={csv_path}", flush=True)
+    timing.add("selector_csvparse_ms", _dt)
+    t0 = time.time()
     by_poc = {}
     for cu in cus:
         by_poc.setdefault(cu["poc"], []).append((cu, h2g.score_cu(cu, w_motion, skip_penalty, w_size, w_residual)))
+    timing.add("selector_scorecu_ms", (time.time() - t0) * 1000)
     return by_poc
 
 
@@ -426,7 +723,10 @@ def _cached_frame_score_map(csv_path: str, poc: int, pocs: tuple, w_motion: floa
     across every spatial tile that needs a crop of it -- replaces re-looping over
     the frame's CU list (and repainting a canvas from scratch) once per tile."""
     by_poc = _cached_by_poc(csv_path, pocs, w_motion, skip_penalty, w_size, w_residual)
-    return h2g.build_frame_score_map(by_poc.get(poc, []), orig_w, orig_h)
+    t0 = time.time()
+    result = h2g.build_frame_score_map(by_poc.get(poc, []), orig_w, orig_h)
+    timing.add("selector_paintmap_ms", (time.time() - t0) * 1000)
+    return result
 
 
 @functools.lru_cache(maxsize=1024)
@@ -523,8 +823,34 @@ def build_gazing_info(
 
     backend: "libde265" (true CU tree via dump_stats CSV; supports sampled_only/
     gop_restart) or "nvdec" (PyNvVideoCodec 16x16 decode-stats, no CSV --
-    windowed encoding only so far, sampled_only/gop_restart not yet wired up).
+    windowed encoding only so far, sampled_only/gop_restart not yet wired up),
+    or "hevc_geo"/"hevc_ord" (hevc_autogaze.py's CU-size-vs-AutoGaze-scale
+    kernel -- routed to a dedicated builder, see
+    _build_gazing_info_hevc_autogaze, since it needs a resized encode rather
+    than this function's native-resolution crop/rasterize flow; sampled_only/
+    gop_restart aren't supported there either).
     """
+    if backend in ("hevc_geo", "hevc_ord"):
+        if sampled_only or gop_restart:
+            raise NotImplementedError(
+                "hevc_geo/hevc_ord backends only support the default windowed "
+                "encoding so far -- sampled_only/gop_restart are libde265-only"
+            )
+        return _build_gazing_info_hevc_autogaze(
+            video_path=video_path,
+            num_video_frames=num_video_frames,
+            num_video_frames_thumbnail=num_video_frames_thumbnail,
+            max_tiles_video=max_tiles_video,
+            autogaze_max_num_frames=autogaze_max_num_frames,
+            image_size=image_size,
+            scales=scales,
+            patch_size=patch_size,
+            gazing_ratio_tile=gazing_ratio_tile,
+            gazing_ratio_thumbnail=gazing_ratio_thumbnail,
+            full_first_frame=full_first_frame,
+            kind=backend,
+        )
+
     find_closest_aspect_ratio = _find_closest_aspect_ratio_fn()
 
     frame_indices = _sampled_frame_indices(video_path, num_video_frames)
@@ -537,23 +863,31 @@ def build_gazing_info(
         npz_path, orig_w, orig_h, poc_map = get_or_build_nvdec_stats(video_path, frame_indices)
 
         def score_region(poc, box_x0, box_y0, box_w, box_h):
+            t0 = time.time()
             grid = _cached_nvdec_cu_scores(npz_path, poc, w_motion, skip_penalty)
-            return h2g.rasterize_multiscale_from_cu_grid(
+            result = h2g.rasterize_multiscale_from_cu_grid(
                 grid, box_x0, box_y0, box_w, box_h, scales, patch_size
             )
+            timing.add("selector_score_ms", (time.time() - t0) * 1000)
+            return result
     elif backend == "libde265":
         csv_path, orig_w, orig_h, poc_map = get_or_build_stats(video_path, frame_indices, sampled_only, gop_restart)
         pocs = tuple(sorted(set(poc_map.values())))
 
         def score_region(poc, box_x0, box_y0, box_w, box_h):
+            t0 = time.time()
             score_map = _cached_frame_score_map(
                 csv_path, poc, pocs, w_motion, skip_penalty, orig_w, orig_h, w_size, w_residual
             )
-            return h2g.rasterize_multiscale_from_map(
+            result = h2g.rasterize_multiscale_from_map(
                 score_map, box_x0, box_y0, box_w, box_h, scales, patch_size
             )
+            timing.add("selector_score_ms", (time.time() - t0) * 1000)
+            return result
     else:
-        raise ValueError(f"unknown codec backend {backend!r} (expected 'libde265' or 'nvdec')")
+        raise ValueError(
+            f"unknown codec backend {backend!r} (expected 'libde265', 'nvdec', 'hevc_geo', or 'hevc_ord')"
+        )
 
     # --- replicate spatial tiling decision (processing_nvila.py::_preprocess_videos) ---
     aspect_ratio = orig_w / orig_h
@@ -605,7 +939,9 @@ def build_gazing_info(
                 poc = poc_map[frame_indices[t_chunk * T_tile + f_local]]
                 scores = score_region(poc, box_x0, box_y0, box_w, box_h)
                 k = total_patches if (full_first_frame and f_local == 0) else topk_ratio(gazing_ratio_tile, f_local)
+                t0 = time.time()
                 ranked = np.sort(np.argsort(-scores)[:k])  # ascending, matching _sort_gazing_pos_per_frame
+                timing.add("selector_rank_ms", (time.time() - t0) * 1000)
                 frame_pos.append(torch.as_tensor(ranked, dtype=torch.long))
                 frame_counts.append(k)
             tile_pos.append(torch.cat(frame_pos))
@@ -630,7 +966,9 @@ def build_gazing_info(
             k = total_patches
         else:
             k = topk_ratio(gazing_ratio_thumbnail if gazing_ratio_thumbnail is not None else 1.0, 0)
+        t0 = time.time()
         ranked = np.sort(np.argsort(-scores)[:k])
+        timing.add("selector_rank_ms", (time.time() - t0) * 1000)
         thumb_pos.append(torch.as_tensor(ranked, dtype=torch.long))
         thumb_counts.append(k)
 

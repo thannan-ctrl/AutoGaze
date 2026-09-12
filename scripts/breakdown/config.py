@@ -87,6 +87,16 @@ CONFIGS = {
     ),
 }
 CONFIGS["codec_nvdec"] = dict(CONFIGS["codec"])
+# Same nominal top-k budget as "codec" (token-count-matched comparison) --
+# these two only change how patches within that budget get scored, not how
+# many get kept. See codec_selector.py's hevc_geo/hevc_ord backends and
+# Codec_Selector_Feasibility.md's "hevc_autogaze integration" section.
+CONFIGS["codec_geo"] = dict(CONFIGS["codec"])
+CONFIGS["codec_ord"] = dict(CONFIGS["codec"])
+# Same token budget as "autogaze" -- only the generation-time scale mask differs
+# (instrumentation.py's SingleScaleLogitsProcessor). See Codec_Selector_Feasibility.md's
+# Next Steps ("test AutoGaze with a single resolution scale").
+CONFIGS["autogaze_singlescale"] = dict(CONFIGS["autogaze"])
 
 
 def dense_frame_budgets() -> list:

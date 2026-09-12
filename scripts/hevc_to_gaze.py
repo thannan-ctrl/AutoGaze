@@ -80,19 +80,26 @@ def parse_csv_for_pocs(csv_path, pocs):
     frames. Scanning every line in the Python interpreter to then discard all
     but 16 POCs was the dominant cost of a codec-mode query (~78s of the ~88s
     end-to-end latency) -- see HEVC_Dump_Pipeline.md's performance-finding
-    section. `grep` (C-speed) pre-filters to just the needed POCs' lines
-    before any Python-level parsing happens.
+    section.
+
+    Filtering is a plain Python byte-prefix scan, not `grep` in a subprocess:
+    this function runs from inside the already-loaded NVILA/AutoGaze process
+    (hundreds of GB resident), where `fork()`ing a subprocess pays for a full
+    page-table clone of that resident memory -- measured at ~1.2s of the
+    ~1.7s "Selector" cost per query in that process, vs. ~0.1s for the same
+    filtering done in-process with no fork at all. See Codec_Selector_Feasibility.md's
+    pipeline-profiling breakdown.
     """
     pocs = sorted({int(p) for p in pocs})
     if not pocs:
         return []
-    pattern = "|".join(f"^{p};" for p in pocs)
-    proc = subprocess.run(
-        ["grep", "-E", pattern, csv_path], capture_output=True, text=True, check=False
-    )
-    if proc.returncode > 1:  # 0 = matches found, 1 = no matches (valid), >1 = error
-        raise RuntimeError(f"grep failed on {csv_path} (exit {proc.returncode}): {proc.stderr}")
-    return _rows_to_cus(csv.reader(proc.stdout.splitlines(), delimiter=";"))
+    prefixes = tuple(f"{p};".encode() for p in pocs)
+    matched = []
+    with open(csv_path, "rb") as f:
+        for line in f:
+            if line.startswith(prefixes):
+                matched.append(line.decode())
+    return _rows_to_cus(csv.reader(matched, delimiter=";"))
 
 
 def score_cu(cu, w_motion, skip_penalty, w_size=1.0, w_residual=0.0):
@@ -139,29 +146,49 @@ def upsample_cu_grid(grid, frame_w, frame_h, cu_size=NVDEC_CU_SIZE):
     return up[:frame_h, :frame_w]
 
 
-def pool_score_map(score_map, grid_size):
-    """Area-average-pool a 2D score map to grid_size x grid_size via an integral
-    image (exact even when the map's dimensions don't divide evenly into
-    grid_size)."""
+def _integral_image(score_map):
+    """Padded 2D integral (summed-area) image of score_map, s.t. the sum over
+    score_map[y0:y1, x0:x1] is integral[y1,x1]-integral[y0,x1]-integral[y1,x0]+integral[y0,x0].
+    Factored out of pool_score_map so callers that pool the *same* canvas at
+    multiple grid_sizes (e.g. AutoGaze's 4-scale pyramid in
+    rasterize_multiscale[_from_map]) compute this O(h*w) cumsum once instead
+    of once per scale -- this was the dominant cost inside "Selector" (see
+    Codec_Selector_Feasibility.md's scoring-vs-ranking profile: scoring was
+    ~98% of Selector time)."""
     import numpy as np
 
     h, w = score_map.shape
     integral = np.zeros((h + 1, w + 1), dtype=np.float64)
     integral[1:, 1:] = np.cumsum(np.cumsum(score_map, axis=0), axis=1)
+    return integral
 
-    grid = np.zeros((grid_size, grid_size), dtype=np.float64)
-    for r in range(grid_size):
-        y0 = round(r * h / grid_size)
-        y1 = round((r + 1) * h / grid_size)
-        for c in range(grid_size):
-            x0 = round(c * w / grid_size)
-            x1 = round((c + 1) * w / grid_size)
-            total = (
-                integral[y1, x1] - integral[y0, x1] - integral[y1, x0] + integral[y0, x0]
-            )
-            area = max((y1 - y0) * (x1 - x0), 1)
-            grid[r, c] = total / area
-    return grid
+
+def _pool_from_integral(integral, h, w, grid_size):
+    """Area-average-pool to grid_size x grid_size from a precomputed integral
+    image (see _integral_image) -- exact even when h/w don't divide evenly
+    into grid_size. Vectorized (no per-cell Python loop) via numpy advanced
+    indexing; numerically identical to the previous nested-loop version since
+    np.round matches Python's round() for these non-negative half-integers."""
+    import numpy as np
+
+    r = np.arange(grid_size)
+    y0 = np.round(r * h / grid_size).astype(np.int64)
+    y1 = np.round((r + 1) * h / grid_size).astype(np.int64)
+    x0 = np.round(r * w / grid_size).astype(np.int64)
+    x1 = np.round((r + 1) * w / grid_size).astype(np.int64)
+    Y1, X1 = np.meshgrid(y1, x1, indexing="ij")
+    Y0, X0 = np.meshgrid(y0, x0, indexing="ij")
+    total = integral[Y1, X1] - integral[Y0, X1] - integral[Y1, X0] + integral[Y0, X0]
+    area = np.maximum((Y1 - Y0) * (X1 - X0), 1)
+    return total / area
+
+
+def pool_score_map(score_map, grid_size):
+    """Area-average-pool a 2D score map to grid_size x grid_size via an integral
+    image (exact even when the map's dimensions don't divide evenly into
+    grid_size)."""
+    h, w = score_map.shape
+    return _pool_from_integral(_integral_image(score_map), h, w, grid_size)
 
 
 def build_frame_score_map(cus, frame_w, frame_h):
@@ -235,11 +262,13 @@ def rasterize_multiscale(cus, box_x0, box_y0, box_w, box_h, scales, patch_size):
     import numpy as np
 
     canvas = cus_to_local_canvas(cus, box_x0, box_y0, box_w, box_h, canvas_size=scales[-1])
+    integral = _integral_image(canvas)
+    h, w = canvas.shape
     grid_sizes = [s // patch_size for s in scales]
     flat = np.zeros(sum(g * g for g in grid_sizes), dtype=np.float64)
     offset = 0
     for g in grid_sizes:
-        flat[offset:offset + g * g] = pool_score_map(canvas, g).flatten()
+        flat[offset:offset + g * g] = _pool_from_integral(integral, h, w, g).flatten()
         offset += g * g
     return flat
 
@@ -253,11 +282,13 @@ def rasterize_multiscale_from_map(score_map, box_x0, box_y0, box_w, box_h, scale
     import numpy as np
 
     canvas = crop_and_resize_map(score_map, box_x0, box_y0, box_w, box_h, canvas_size=scales[-1])
+    integral = _integral_image(canvas)
+    h, w = canvas.shape
     grid_sizes = [s // patch_size for s in scales]
     flat = np.zeros(sum(g * g for g in grid_sizes), dtype=np.float64)
     offset = 0
     for g in grid_sizes:
-        flat[offset:offset + g * g] = pool_score_map(canvas, g).flatten()
+        flat[offset:offset + g * g] = _pool_from_integral(integral, h, w, g).flatten()
         offset += g * g
     return flat
 

@@ -40,8 +40,8 @@ def load_done_ids(mode: str) -> dict:
 def run_question(model, llm_call_state, proc, item: dict, mode: str = None, skip_llm: bool = False) -> dict:
     text = f"{proc.tokenizer.video_token}\n\n{dataset.build_prompt(item)}"
 
-    if mode in ("codec", "codec_nvdec"):
-        from . import codec_selector
+    from . import codec_selector
+    if mode in codec_selector.BACKEND_FOR_MODE:
         instrumentation.set_codec_video_context(item["video_path"], backend=codec_selector.BACKEND_FOR_MODE[mode])
 
     timing.reset()
@@ -72,7 +72,23 @@ def run_question(model, llm_call_state, proc, item: dict, mode: str = None, skip
         preproc_timing["gazing_info_total_ms"] - preproc_timing["autogaze_model_ms"], 0.0
     )
     autogaze_model_ms = preproc_timing["autogaze_model_ms"]
+    codec_encode_ms = preproc_timing["codec_encode_ms"]
+    codec_decode_ms = preproc_timing["codec_decode_ms"]
+    selector_score_ms = preproc_timing["selector_score_ms"]
+    selector_rank_ms = preproc_timing["selector_rank_ms"]
+    selector_csvparse_ms = preproc_timing["selector_csvparse_ms"]
+    selector_scorecu_ms = preproc_timing["selector_scorecu_ms"]
+    selector_paintmap_ms = preproc_timing["selector_paintmap_ms"]
     other_ms = max(preproc_ms - decode_ms - image_preproc_ms - autogaze_ops_ms - autogaze_model_ms, 0.0)
+    gazing_info_total_ms = preproc_timing["gazing_info_total_ms"]
+    # Everything build_gazing_info() spends that isn't inside the codec
+    # encode/decode/score/rank sub-timers -- e.g. the per-region/per-tile
+    # Python loop, crop-box math, poc_map bookkeeping. See the "unaccounted
+    # ~0.68s" gap noted in Codec_Selector_Feasibility.md's codec_nvdec row.
+    selector_glue_ms = max(
+        gazing_info_total_ms - codec_encode_ms - codec_decode_ms - selector_score_ms - selector_rank_ms,
+        0.0,
+    )
 
     if skip_llm:
         # Patch-selection-only latency probe: never touch the LLM (no
@@ -90,6 +106,15 @@ def run_question(model, llm_call_state, proc, item: dict, mode: str = None, skip
             "image_preproc_ms": image_preproc_ms,
             "autogaze_ops_ms": autogaze_ops_ms,
             "autogaze_model_ms": autogaze_model_ms,
+            "codec_encode_ms": codec_encode_ms,
+            "codec_decode_ms": codec_decode_ms,
+            "selector_score_ms": selector_score_ms,
+            "selector_rank_ms": selector_rank_ms,
+            "selector_csvparse_ms": selector_csvparse_ms,
+            "selector_scorecu_ms": selector_scorecu_ms,
+            "selector_paintmap_ms": selector_paintmap_ms,
+            "gazing_info_total_ms": gazing_info_total_ms,
+            "selector_glue_ms": selector_glue_ms,
             "other_ms": other_ms,
             "cpu_ms": decode_ms + image_preproc_ms + autogaze_ops_ms + other_ms,
             "gpu_ms": autogaze_model_ms,
@@ -131,6 +156,15 @@ def run_question(model, llm_call_state, proc, item: dict, mode: str = None, skip
         "image_preproc_ms": image_preproc_ms,
         "autogaze_ops_ms": autogaze_ops_ms,
         "autogaze_model_ms": autogaze_model_ms,
+        "codec_encode_ms": codec_encode_ms,
+        "codec_decode_ms": codec_decode_ms,
+        "selector_score_ms": selector_score_ms,
+        "selector_rank_ms": selector_rank_ms,
+        "selector_csvparse_ms": selector_csvparse_ms,
+        "selector_scorecu_ms": selector_scorecu_ms,
+        "selector_paintmap_ms": selector_paintmap_ms,
+        "gazing_info_total_ms": gazing_info_total_ms,
+        "selector_glue_ms": selector_glue_ms,
         "other_ms": other_ms,
         "cpu_ms": decode_ms + image_preproc_ms + autogaze_ops_ms + other_ms,
         "gpu_ms": autogaze_model_ms,
@@ -208,6 +242,9 @@ def run_mode(mode: str, model, llm_call_state, samples: list, skip_llm: bool = F
                             flush=True,
                         )
                 except Exception as e:
+                    if os.environ.get("DEBUG_TRACEBACK"):
+                        import traceback
+                        traceback.print_exc()
                     r = {"item_id": item["item_id"], "error": str(e)}
                     break
                 finally:
