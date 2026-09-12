@@ -50,14 +50,7 @@ huggingface-cli download VLM2Vec/egoschema-rawvideo --repo-type dataset --local-
 git clone https://github.com/egoschema/EgoSchema.git /tmp/EgoSchema_official
 cp /tmp/EgoSchema_official/questions.json /tmp/EgoSchema_official/subset_answers.json data/egoschema/
 
-python3 -c "
-import json
-q = {x['q_uid']: x for x in json.load(open('data/egoschema/questions.json'))}
-a = json.load(open('data/egoschema/subset_answers.json'))
-subset = [{**q[k], 'answer': v} for k, v in a.items()]
-json.dump(subset, open('data/egoschema/subset.json', 'w'))
-print(len(subset), 'questions written')
-"
+python3 scripts/build_egoschema_subset.py
 ```
 Models download themselves on first run — nothing to do there.
 
