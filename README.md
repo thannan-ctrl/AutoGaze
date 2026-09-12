@@ -211,37 +211,89 @@ quota, concurrent-writer resume bugs) hit while gathering this data.
 **Full results, methodology, comparison videos, and reproduction commands:**
 [`Codec_Selector_Feasibility.md`](Codec_Selector_Feasibility.md).
 
-## Running `codec_nvdec` (optimized selector) — quickstart
+## Quickstart: `dense`, `codec` (optimized selector), `codec_nvdec` (optimized selector)
 
-The fastest mode measured so far: 60.6% accuracy / **2.44s** avg end-to-end on EgoSchema
-(vs. 6.24s for AutoGaze's own trained selector) — see
-[`Codec_Selector_Feasibility.md`](Codec_Selector_Feasibility.md) for the full table. This
-section is the minimal path to reproduce that specific number.
+The three modes worth trying first, in ascending order of speed — see
+[`Codec_Selector_Feasibility.md`](Codec_Selector_Feasibility.md) for the full table and
+methodology:
 
-**Prerequisites** (on top of the pip deps in "Installation" above):
-- GB200-class hardware with NVIDIA driver ≥595.84.01 / Video Codec SDK 13.1+. Only confirmed
-  working on `gb200nvl4`-class nodes this session — an older-driver node (e.g.
-  `gb200nvl72_preprod`) does not support NVDEC and `codec_nvdec` will fail there.
-- `PyNvVideoCodec` (`pip install PyNvVideoCodec`, same environment as the rest of the repo).
-- `scripts/nvdec_dump.py` (included in this branch) — the PyNvVideoCodec wrapper
-  `codec_nvdec` requires. Without it, `codec_nvdec` raises
-  `"backend='nvdec' requires scripts/nvdec_dump.py"` immediately.
+| Mode | What it is | EgoSchema acc. | Avg E2E |
+|---|---|--:|--:|
+| `dense` | No patch selection at all (baseline) | 58.6% | 4.38s |
+| `codec` (optimized selector) | HEVC motion/size heuristic, CPU (`libde265`) decode | 61.6% | 4.50s |
+| `codec_nvdec` (optimized selector) | Same heuristic, GPU (NVDEC) decode | 60.6% | **2.44s** |
 
-Unlike `codec`/`codec_geo`/`codec_ord` (the CPU/`libde265` backends), `codec_nvdec` does
-**not** need the `scripts/hevc_dump` submodule built — that's only on the CPU decode path.
-If you want those other modes too, see `Codec_Selector_Feasibility.md`'s Implementation
-section for the extra CMake build step.
+Every command below, start to finish, in order — no assumed prior setup. `codec_nvdec`
+additionally needs GB200-class hardware with NVIDIA driver ≥595.84.01 / Video Codec SDK
+13.1+ (confirmed working on `gb200nvl4`-class nodes; an older-driver node such as
+`gb200nvl72_preprod` does not support NVDEC and that one mode will fail there — `dense` and
+`codec` don't have this requirement).
 
-**Run it:**
-
+**1. Clone this branch** (with the `hevc_dump` submodule):
 ```bash
-FIXED_NUM_VIDEO_FRAMES=16 N_SAMPLES=full MAX_BATCH_SIZE_AUTOGAZE=32 \
-  MODES=codec_nvdec DATASET=egoschema \
-  python3 scripts/nvila_hd_accuracy_breakdown_test.py
+git clone --recurse-submodules --branch share/codec-nvdec-quickstart \
+  git@github.com:thannan-ctrl/AutoGaze.git AutoGaze
+cd AutoGaze
+```
+If you cloned without `--recurse-submodules`, or the branch was cloned before the submodule
+was in place:
+```bash
+git submodule update --init --recursive
 ```
 
-Expected result (full N=500 EgoSchema Subset): **60.6% accuracy, ~2.44s avg end-to-end** —
-if your numbers are in that ballpark, setup worked.
+**2. Create the environment and install dependencies:**
+```bash
+conda create -n autogaze python=3.11 && conda activate autogaze
+conda install -c nvidia cuda-toolkit=12.8   # match your installed torch's CUDA version if different
+pip install uv
+uv pip install -e .
+pip install PyNvVideoCodec   # only needed for codec_nvdec
+```
+If that fails on your CUDA/architecture, install `torch`/`transformers` for your platform
+manually first, then `pip install -e . --no-deps`. On aarch64 (GB200),
+`transformers~=4.51` in `pyproject.toml` is too old — use `transformers==5.14.1` instead.
+
+**3. Build `hevc_dump`** (only needed for `codec`; skip this step if you only want
+`dense`/`codec_nvdec`):
+```bash
+cd scripts/hevc_dump
+mkdir cmake_build && cd cmake_build
+cmake ..
+make -j4
+cd ../../..
+```
+(Full details, including why this exists, in
+[`scripts/hevc_dump/README.md`](scripts/hevc_dump/README.md).)
+
+**4. Get the EgoSchema data** (the table above is measured on this — the full official
+500-question Subset):
+```bash
+mkdir -p data/egoschema
+huggingface-cli download VLM2Vec/egoschema-rawvideo --repo-type dataset \
+  --local-dir data/egoschema/videos
+```
+Then place `data/egoschema/subset.json` (`{q_uid, question, "option 0".."option 4",
+answer, ...}` per question) — source it from the official EgoSchema repo
+(github.com/egoschema/EgoSchema); it isn't part of the video download above. No model
+download step is needed — `nvidia/NVILA-8B-HD-Video` and `nvidia/AutoGaze` auto-download
+from Hugging Face Hub on first run (`trust_remote_code=True`, neither gated nor private).
+
+To run against VideoMME instead (`DATASET=video_mme` below), you'll need to source that
+dataset's videos/questions separately — see the "Dataset coverage" note in
+[`Codec_Selector_Feasibility.md`](Codec_Selector_Feasibility.md)'s Implementation section
+for what's expected under `data/video_mme/`.
+
+**5. Run it** (drop `codec` from `MODES=` if you skipped step 3):
+```bash
+CUDA_VISIBLE_DEVICES=0 REPO_DIR=$(pwd) NVILA_DEVICE=cuda:0 \
+  FIXED_NUM_VIDEO_FRAMES=16 N_SAMPLES=full MAX_BATCH_SIZE_AUTOGAZE=32 \
+  MODES=dense,codec,codec_nvdec DATASET=egoschema \
+  python3 scripts/nvila_hd_accuracy_breakdown_test.py
+```
+`CUDA_VISIBLE_DEVICES` selects which local GPU to use. Results land in
+`benchmark_results/nvila_hd_accuracy_breakdown_{mode}_egoschema_nvf16.jsonl` (per-question)
+and the matching `_summary_*.json` (averaged) — expected values are the table above; if
+your numbers land in that ballpark, setup worked.
 
 ## Idea: Student Distillation for Faster AutoGaze
 
