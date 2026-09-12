@@ -5,11 +5,11 @@ printing the final table. Everything below is a plain command meant to be typed 
 tooling assumed. See [`Codec_Selector_Feasibility.md`](Codec_Selector_Feasibility.md) for
 the full methodology.
 
-| Mode | What it is | EgoSchema acc. | Avg E2E |
-|---|---|--:|--:|
-| `dense` | No patch selection at all (baseline) | 58.6% | 4.38s |
-| `codec` (optimized selector) | HEVC motion/size heuristic, CPU (`libde265`) decode | 61.6% | 4.50s |
-| `codec_nvdec` (optimized selector) | Same heuristic, GPU (NVDEC) decode | 60.6% | **2.44s** |
+| Mode | What it is | N | Acc | Tokens | Encode | Decode | Selector | ViT | LLM | E2E |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `dense` | No patch selection at all (baseline) | 500 | 58.6% | 24,176 | — | — | — | 2.70s | 0.80s | 4.38s |
+| `codec` (optimized selector) | HEVC motion/size heuristic, CPU (`libde265`) decode | 500 | 61.6% | 2,716 | 0.87s | 1.11s | 1.40s | 0.16s | 0.29s | 4.50s |
+| `codec_nvdec` (optimized selector) | Same heuristic, GPU (NVDEC) decode | 500 | 60.6% | 2,716 | 0.86s | 0.09s | 0.37s | 0.16s | 0.28s | **2.44s** |
 
 `codec_nvdec` needs GB200-class hardware with NVIDIA driver ≥595.84.01 / Video Codec SDK
 13.1+ (confirmed on `gb200nvl4`-class nodes; an older-driver node does not support NVDEC —
